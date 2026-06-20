@@ -13,7 +13,7 @@ import subprocess
 from datetime import datetime, time as dt_time
 
 # --- 极客配置区 ---
-LLM_HOST = "http://127.0.0.1:8080"
+LLM_HOST = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:8080")
 HEALTH_ENDPOINT = f"{LLM_HOST}/health" # 或者 /v1/models 根据你的 llama.cpp 实际 endpoint 调整
 START_SCRIPT = r"C:\Users\a2515\ai-trader\scripts\222.bat" # 替换为你的启动脚本绝对路径
 PROCESS_NAME = "llama-server.exe" # llama.cpp 在 Windows 下的进程名，若是其他请在此修改

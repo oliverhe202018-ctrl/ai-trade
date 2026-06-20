@@ -903,8 +903,8 @@ def fetch_realtime_and_fundamentals(stock_code: str) -> dict:
     }
 
     try:
-        # 强制转换为字符串，剔除可能的前缀，并补齐 6 位数字（防止 000001 变成 1）
-        clean_code = str(stock_code).lower().replace('sh', '').replace('sz', '').replace('bj', '').strip().zfill(6)
+        # 使用统一清洗工具规范化股票代码
+        clean_code = _normalize_code(stock_code)
 
         # 从全局缓存获取全市场 DataFrame（30 秒 TTL）
         spot_df = get_global_spot_data()

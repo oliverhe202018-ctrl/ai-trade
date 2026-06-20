@@ -352,18 +352,27 @@ def start_zmq_telemetry():
         socket.setsockopt_string(zmq.SUBSCRIBE, "TRADE_SIGNAL")
         socket.setsockopt(zmq.RCVTIMEO, 3000)  # 3 秒超时，避免线程卡死
 
-        while True:
-            try:
-                msg = socket.recv_string()
-                _, payload = msg.split(" ", 1)
-                order_data = json.loads(payload)
-                order_data["recv_time"] = datetime.now().strftime("%H:%M:%S")
-                order_queue.appendleft(order_data)
-                status["last_msg_time"] = order_data["recv_time"]
-            except zmq.Again:
-                continue  # 超时，继续监听
-            except Exception:
-                time.sleep(1)
+        try:
+            while True:
+                try:
+                    msg = socket.recv_string()
+                    _, payload = msg.split(" ", 1)
+                    order_data = json.loads(payload)
+                    order_data["recv_time"] = datetime.now().strftime("%H:%M:%S")
+                    order_queue.appendleft(order_data)
+                    status["last_msg_time"] = order_data["recv_time"]
+                except zmq.Again:
+                    continue  # 超时，继续监听
+                except zmq.ZMQError as zmq_err:
+                    if zmq_err.errno == zmq.ETERM:
+                        break  # Context 被销毁，退出循环
+                    time.sleep(3)
+                except Exception:
+                    time.sleep(1)
+        finally:
+            socket.close()
+            context.term()
+            status["thread_alive"] = False
 
     t = threading.Thread(target=zmq_listener, daemon=True)
     t.start()
@@ -973,57 +982,34 @@ def render_deep_dive_analysis(watchlist):
 @st.cache_data(ttl="60s", show_spinner=False)
 def get_enriched_watchlist_df(watchlist_codes: tuple) -> pd.DataFrame:
     """
-    自选股列表富化 - 带缓存保护（60 秒 TTL）。
-    内部获取全局大盘内存快照，直接在内存中匹配，彻底消除 N+1 循环网络 IO。
+    自选股列表富化 - 仅请求一次全市场快照 + 纯内存匹配，彻底避免 N+1 IO。
     """
     import pandas as pd
     from feeds.market_data import get_global_spot_data, _normalize_code
 
-    table_data = []
-    
-    # 1. 获取全局大盘内存快照 (一次性获取，不发起多次调用)
-    spot_df = get_global_spot_data()
-    
-    # 2. 如果快照不为空，做一些预处理，转换为字典便于 O(1) 查找
-    lookup_dict = {}
-    if spot_df is not None and not spot_df.empty and "代码" in spot_df.columns:
-        temp_df = spot_df.copy()
-        temp_df["代码"] = temp_df["代码"].astype(str).str.zfill(6)
-        for _, row in temp_df.iterrows():
-            code_str = row["代码"]
-            lookup_dict[code_str] = {
-                "name": str(row.get("名称", "N/A")),
-                "latest_price": float(row.get("最新价", 0.0)) if pd.notna(row.get("最新价")) else 0.0,
-                "change_pct": float(row.get("涨跌幅", 0.0)) if pd.notna(row.get("涨跌幅")) else 0.0,
-            }
-
-    # 3. 循环匹配
+    spot_df = get_global_spot_data()  # 仅请求一次全市场快照
+    rows = []
     for i, code in enumerate(watchlist_codes):
-        clean_code = _normalize_code(code)
+        clean = _normalize_code(code)
+        if spot_df is not None and not spot_df.empty and "代码" in spot_df.columns:
+            match = spot_df[spot_df["代码"].astype(str).str.zfill(6) == clean]
+            row = match.iloc[0].fillna(0) if not match.empty else pd.Series()
+        else:
+            row = pd.Series()
         
-        # 从字典中查找数据，如果不存在则使用默认值，严禁发起网络请求
-        real_data = lookup_dict.get(clean_code, {
-            "name": "N/A",
-            "latest_price": 0.0,
-            "change_pct": 0.0
-        })
-        
-        name = real_data["name"]
-        if name == "N/A":
-            name = code
-            
-        price = real_data["latest_price"]
-        change_pct = real_data["change_pct"]
+        name = str(row.get("名称", code)) if not row.empty and row.get("名称") != 0 else code
+        price = float(row.get("最新价", 0.0)) if not row.empty else 0.0
+        change_pct = float(row.get("涨跌幅", 0.0)) if not row.empty else 0.0
 
-        table_data.append({
+        rows.append({
             "序号": i + 1,
             "股票代码": code,
             "股票名称": name,
             "最新价": f"¥{price:.2f}" if price > 0 else "N/A",
             "涨跌幅": f"{change_pct:+.2f}%" if price > 0 else "N/A",
         })
-
-    return pd.DataFrame(table_data)
+        
+    return pd.DataFrame(rows)
 
 
 def module_watchlist_manager():

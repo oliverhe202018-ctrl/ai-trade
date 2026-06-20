@@ -20,7 +20,8 @@ DEFAULT_HYPERPARAMS = {
 }
 
 # 本地大模型 API 地址
-LLM_API_URL = "http://127.0.0.1:8080/v1/chat/completions"
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:8080")
+LLM_API_URL = f"{LLM_BASE_URL}/v1/chat/completions"
 
 # System Prompt：强制模型扮演首席量化风控官，只输出纯 JSON
 SYSTEM_PROMPT = """你现在的角色是首席量化风控官。请根据下述报告，输出最新的风控参数与深度复盘。

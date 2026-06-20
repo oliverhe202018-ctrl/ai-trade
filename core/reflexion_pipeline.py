@@ -17,8 +17,9 @@ from core.chroma_manager import add_trading_experience
 # ==================== 客户端初始化 ====================
 
 # Generator: 本地 Hermes 模型
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:8080")
 generator_client = OpenAI(
-    base_url="http://127.0.0.1:8080/v1",
+    base_url=f"{LLM_BASE_URL}/v1",
     api_key="not-needed",
 )
 

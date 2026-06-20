@@ -6,8 +6,11 @@
 3. 输出格式：{"macro_sentiment": 1, "hot_sectors": ["半导体"], "risk_warnings": ["sh600519"]}
 """
 import json
+import os
 import re
 import requests
+
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:8080")
 from datetime import datetime, timedelta
 
 from core.logger_config import logger
@@ -122,7 +125,7 @@ def extract_sentiment_with_llm(news_list):
 
     try:
         response = requests.post(
-            "http://127.0.0.1:8080/v1/chat/completions",
+            f"{LLM_BASE_URL}/v1/chat/completions",
             json={
                 "model": "local-model",
                 "messages": messages,
