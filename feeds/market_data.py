@@ -1020,11 +1020,11 @@ def fetch_technical_indicators(stock_code: str) -> dict:
         resistance = float(round(float(recent_20.max()), 2))
 
         return {
-            "rsi": round(rsi, 1),
-            "macd_signal": macd_signal,
-            "trend": trend,
-            "support": support,
-            "resistance": resistance,
+            "rsi": float(round(rsi, 1)),           # 强制原生 float
+            "macd_signal": str(macd_signal),       # 强制原生 str
+            "trend": str(trend),                   # 强制原生 str
+            "support": float(support),             
+            "resistance": float(resistance),       
         }
 
     except Exception as e:

@@ -101,9 +101,30 @@ def _phase_order_execution():
 
 
 def _phase_daily_settlement():
-    """阶段三：日终结算 - 委托 live_trader 执行"""
-    from live_trader import phase_daily_settlement
-    phase_daily_settlement()
+    """阶段三：日终结算 - 独立状态快照，不依赖 live_trader"""
+    from core.logger_config import logger
+    from pathlib import Path
+    import json
+    from datetime import datetime
+    
+    logger.info("[日终结算] 开始执行投资组合状态落盘...")
+    try:
+        cache_file = Path("./data_cache/live_portfolio.json")
+        if cache_file.exists():
+            with open(cache_file, "r", encoding="utf-8") as f:
+                portfolio = json.load(f)
+            
+            # 日终快照备份
+            date_str = datetime.now().strftime("%Y%m%d")
+            snapshot_file = Path(f"./data_cache/settlement_{date_str}.json")
+            with open(snapshot_file, "w", encoding="utf-8") as f:
+                portfolio["settlement_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                json.dump(portfolio, f, ensure_ascii=False, indent=2)
+            logger.info(f"[日终结算] 状态快照已落盘: {snapshot_file}")
+        else:
+            logger.warning("[日终结算] live_portfolio.json 不存在，跳过结算")
+    except Exception as e:
+        logger.exception(f"[日终结算] 落盘失败: {e}")
 
 
 if __name__ == "__main__":

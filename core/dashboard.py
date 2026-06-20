@@ -973,24 +973,47 @@ def render_deep_dive_analysis(watchlist):
 @st.cache_data(ttl="60s", show_spinner=False)
 def get_enriched_watchlist_df(watchlist_codes: tuple) -> pd.DataFrame:
     """
-    自选股列表富化 - 带缓存保护（10 秒 TTL）。
-    内部调用 fetch_realtime_and_fundamentals，后者复用全局缓存的全市场数据，
-    彻底消除 N+1 全市场网络 IO 阻塞。
+    自选股列表富化 - 带缓存保护（60 秒 TTL）。
+    内部获取全局大盘内存快照，直接在内存中匹配，彻底消除 N+1 循环网络 IO。
     """
     import pandas as pd
-    from feeds.market_data import fetch_realtime_and_fundamentals
+    from feeds.market_data import get_global_spot_data, _normalize_code
 
     table_data = []
+    
+    # 1. 获取全局大盘内存快照 (一次性获取，不发起多次调用)
+    spot_df = get_global_spot_data()
+    
+    # 2. 如果快照不为空，做一些预处理，转换为字典便于 O(1) 查找
+    lookup_dict = {}
+    if spot_df is not None and not spot_df.empty and "代码" in spot_df.columns:
+        temp_df = spot_df.copy()
+        temp_df["代码"] = temp_df["代码"].astype(str).str.zfill(6)
+        for _, row in temp_df.iterrows():
+            code_str = row["代码"]
+            lookup_dict[code_str] = {
+                "name": str(row.get("名称", "N/A")),
+                "latest_price": float(row.get("最新价", 0.0)) if pd.notna(row.get("最新价")) else 0.0,
+                "change_pct": float(row.get("涨跌幅", 0.0)) if pd.notna(row.get("涨跌幅")) else 0.0,
+            }
+
+    # 3. 循环匹配
     for i, code in enumerate(watchlist_codes):
-        try:
-            real_data = fetch_realtime_and_fundamentals(code)
-            name = real_data.get("name", code)
-            price = real_data.get("latest_price", 0)
-            change_pct = real_data.get("change_pct", 0)
-        except Exception:
+        clean_code = _normalize_code(code)
+        
+        # 从字典中查找数据，如果不存在则使用默认值，严禁发起网络请求
+        real_data = lookup_dict.get(clean_code, {
+            "name": "N/A",
+            "latest_price": 0.0,
+            "change_pct": 0.0
+        })
+        
+        name = real_data["name"]
+        if name == "N/A":
             name = code
-            price = 0
-            change_pct = 0
+            
+        price = real_data["latest_price"]
+        change_pct = real_data["change_pct"]
 
         table_data.append({
             "序号": i + 1,
