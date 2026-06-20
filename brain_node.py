@@ -8,7 +8,7 @@ import time
 import json
 import zmq
 from datetime import datetime
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from dotenv import load_dotenv
 
 # 添加项目根目录到 Python 路径，确保 core 和 feeds 模块可被引用
@@ -34,6 +34,32 @@ LIVE_UNIVERSE = BACKTEST_UNIVERSE
 _dca_traded_today = set()
 _last_dca_date = datetime.now().date()
 
+class LRUStockHistory(OrderedDict):
+    def __init__(self, maxsize=50, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.maxsize = maxsize
+
+    def __getitem__(self, key):
+        if key not in self:
+            val = {"prices": [], "highs": [], "lows": [], "main_funds": []}
+            self[key] = val
+            return val
+        self.move_to_end(key)
+        return super().__getitem__(key)
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.move_to_end(key)
+        if len(self) > self.maxsize:
+            self.popitem(last=False)
+
+    def get(self, key, default=None):
+        if key in self:
+            self.move_to_end(key)
+            return self[key]
+        return default
+
+
 def run_slow_brain():
     logger.info("=" * 70)
     logger.info("🧠 满血慢脑节点 (Slow Brain) 已启动 - ZeroMQ 指挥官")
@@ -44,7 +70,7 @@ def run_slow_brain():
     socket = context.socket(zmq.PUB)
     socket.bind("tcp://127.0.0.1:5555")
 
-    _stock_history = defaultdict(lambda: {"prices": [], "highs": [], "lows": [], "main_funds": []})
+    _stock_history = LRUStockHistory(maxsize=50)
     _config = {
         "max_positions": 5,
         "sell": {"stop_loss_pct": -10.0, "take_profit_pct": 15.0},
@@ -59,6 +85,20 @@ def run_slow_brain():
         step_pct=_config["grid"]["step_pct"], 
         trade_amount=_config["grid"]["trade_amount"]
     )
+
+    def send_order(action: str, code: str, shares: int, price: float, reason: str):
+        # 5分钟指纹幂等性ID
+        order_id = f"{code}_{action}_{int(time.time())//300}"
+        order = {
+            "order_id": order_id,
+            "action": action,
+            "code": code,
+            "shares": int(shares),
+            "signal_price": float(price),
+            "reason": str(reason)
+        }
+        socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
+        logger.info(f"📡 [广播指令] {action}: {code} | 股数: {shares} | 信号价: {price:.2f} | ID: {order_id} | 原因: {reason}")
 
     # ================= 新增：启动时进行历史数据预热 =================
     logger.info("⏳ 正在预热 60 日历史行情底座，构建策略路由上下文...")
@@ -92,15 +132,30 @@ def run_slow_brain():
         if not portfolio:
             portfolio = {"cash": 100000, "positions": {}}
 
-        # 2. 获取实时行情
+        # 2. 获取实时行情 - ThreadPoolExecutor 并发拉取
         daily_quotes = []
-        for code in LIVE_UNIVERSE:
+        import concurrent.futures
+        import random
+
+        def fetch_one(code):
             try:
+                # 批次内的轻量随机抖动，防封杀 (0.1s ~ 0.3s)
+                time.sleep(random.uniform(0.1, 0.3))
                 _, quotes, _ = download_historical_data(code, days=1)
-                if quotes: daily_quotes.extend(quotes)
-                time.sleep(1.0) # 防止反爬
-            except Exception:
-                continue
+                return quotes
+            except Exception as e:
+                logger.warning(f"[MarketData] 获取 {code} 实时行情失败: {e}")
+                return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(LIVE_UNIVERSE), 10)) as executor:
+            future_to_code = {executor.submit(fetch_one, code): code for code in LIVE_UNIVERSE}
+            for future in concurrent.futures.as_completed(future_to_code):
+                try:
+                    quotes = future.result()
+                    if quotes:
+                        daily_quotes.extend(quotes)
+                except Exception as e:
+                    logger.error(f"[MarketData] 并发获取失败: {e}")
 
         if not daily_quotes:
             logger.info("未获取到行情，休眠等待...")
@@ -128,9 +183,7 @@ def run_slow_brain():
         # 3. 生成卖出信号并直接广播
         sells = generate_sell_signals(portfolio["positions"], daily_quotes, _config)
         for sell in sells:
-            order = {"action": "SELL", "code": sell["code"], "shares": sell["shares"], "signal_price": sell["price"], "reason": sell["reason"]}
-            socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
-            logger.info(f"📡 [广播指令] 卖出: {sell['code']} (信号价: {sell['price']:.2f})")
+            send_order(action="SELL", code=sell["code"], shares=sell["shares"], price=sell["price"], reason=sell["reason"])
 
         # 4. 动态策略路由分类
         regime_buckets = {"grid": [], "smart_dca": [], "trend": []}
@@ -162,11 +215,9 @@ def run_slow_brain():
                 for signal in grid_signals:
                     shares = max(100, int(_grid_mgr.trade_amount / price_map[code] / 100) * 100)
                     if signal["action"] == "BUY":
-                        order = {"action": "BUY", "code": code, "shares": shares, "signal_price": signal["price"], "reason": f"网格买入 (L{signal['grid_level']})"}
-                        socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
+                        send_order(action="BUY", code=code, shares=shares, price=signal["price"], reason=f"网格买入 (L{signal['grid_level']})")
                     elif signal["action"] == "SELL" and held_shares >= shares:
-                        order = {"action": "SELL", "code": code, "shares": shares, "signal_price": signal["price"], "reason": f"网格卖出 (L{signal['grid_level']})"}
-                        socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
+                        send_order(action="SELL", code=code, shares=shares, price=signal["price"], reason=f"网格卖出 (L{signal['grid_level']})")
 
         # ==========================================
         # C3: 智能定投广播 (已注入利润垫核算)
@@ -216,8 +267,7 @@ def run_slow_brain():
                 else:
                     shares = max(100, int(base_amount * multiplier / price / 100) * 100)
 
-                order = {"action": "BUY", "code": code, "shares": shares, "signal_price": price, "reason": f"Smart DCA (乘数{multiplier})"}
-                socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
+                send_order(action="BUY", code=code, shares=shares, price=price, reason=f"Smart DCA (乘数{multiplier})")
 
                 # 🔒 记录已定投标的，防止日内重复
                 _dca_traded_today.add(code)
@@ -254,8 +304,7 @@ def run_slow_brain():
                     shares = buy["shares"]
 
                 if shares >= 100:
-                    order = {"action": "BUY", "code": code, "shares": shares, "signal_price": price, "reason": f"{buy.get('reason', '')} | ATR={atr:.2f}"}
-                    socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
+                    send_order(action="BUY", code=code, shares=shares, price=price, reason=f"{buy.get('reason', '')} | ATR={atr:.2f}")
 
             # 左侧均值回归
             mr_candidates = mean_reversion_scan(trend_quotes, _config, min_score=75)
@@ -281,8 +330,7 @@ def run_slow_brain():
                     shares = int(total_capital * 0.10 / price / 100) * 100
                 
                 if shares >= 100:
-                    order = {"action": "BUY", "code": mr.stock_code, "shares": shares, "signal_price": price, "reason": f"{mr.buy_reason} | ATR={atr:.2f}"}
-                    socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
+                    send_order(action="BUY", code=mr.stock_code, shares=shares, price=price, reason=f"{mr.buy_reason} | ATR={atr:.2f}")
 
         logger.info(f"🧠 本轮演算及广播完毕，休眠 60 秒等待下个切片...")
         time.sleep(60)

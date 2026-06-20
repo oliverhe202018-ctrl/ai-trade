@@ -8,6 +8,7 @@ import time
 import json
 import zmq
 from datetime import datetime
+from collections import OrderedDict
 from dotenv import load_dotenv
 
 # 添加项目根目录到 Python 路径，确保 core 和 feeds 模块可被引用
@@ -80,6 +81,9 @@ def run_fast_hand():
     settled_today = False
     logger.info("[快手] 正在监听大模型战术指挥网 (TCP 5555)...")
 
+    executed_ids = OrderedDict()
+    max_cache_size = 500
+
     while True:
         now = datetime.now()
         
@@ -88,6 +92,18 @@ def run_fast_hand():
             message = socket.recv_string(flags=zmq.NOBLOCK)
             _, payload = message.split(" ", 1)
             order = json.loads(payload)
+            
+            # 校验指纹 ID 幂等性
+            order_id = order.get("order_id")
+            if order_id:
+                if order_id in executed_ids:
+                    executed_ids.move_to_end(order_id)
+                    logger.warning(f"⚠️ [幂等拦截] 截获重复指令 ID: {order_id}，已自动丢弃并忽略")
+                    continue
+                executed_ids[order_id] = True
+                if len(executed_ids) > max_cache_size:
+                    executed_ids.popitem(last=False)
+            
             logger.info(f"\n🎯 [瞬时截获指令] {order['action']} {order['code']} ({order['reason']})")
             
             # 瞬间开火
