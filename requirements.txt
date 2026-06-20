@@ -1,2 +1,23 @@
-aiohttp>=3.9.0
+# AI Trader 依赖包
+
+# 核心依赖
+python-dotenv>=1.0.0
+openai>=1.0.0
+schedule>=1.2.0
+aiohttp>=3.8.0
 psutil>=5.9.0
+filelock>=3.12.0
+PyYAML>=6.0.0
+
+# 数据处理
+pandas>=2.0.0
+numpy>=1.24.0
+
+# 向量数据库 (反思管线)
+chromadb>=0.4.0
+
+# 其他工具库
+requests>=2.31.0
+
+# 行情数据 (AkShare)
+akshare>=1.10.0

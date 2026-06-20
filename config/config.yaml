@@ -1,0 +1,118 @@
+# AI 炒股系统配置
+# 修改后无需重启，系统会重新加载
+
+# ==================== 全局设置 ====================
+
+# 交易模式: mock(模拟盘) / easytrader(同花顺) / tdx(通达信) / qmt(QMT)
+broker_mode: mock
+
+# 初始资金 (Mock 模式)
+initial_capital: 50000
+# 日目标盈亏 (Mock 模式)
+daily_profit_target: 50
+
+# 数据源: tencent(腾讯) / sina(新浪)
+data_source: tencent
+
+# ==================== 策略配置 ====================
+strategy:
+  type: trend  # trend(趋势跟踪) / value(价值投资) / momentum(动量策略)
+  # 选股涨幅过滤范围 (%)
+  safe_gain_range: [-3, 3]
+  # 排除行业 (示例: ["房地产", "银行"])
+  exclude_sectors: []
+  # 最大持仓数
+  max_positions: 10
+  # 最大单板块资金占比 (%)
+  max_sector_pct: 30
+  # 每只股票最大仓位占比 (%)
+  max_single_pct: 25
+  # 单板块最多买几只
+  max_per_sector: 2
+  # 最小买入金额 (元)
+  min_buy_amount: 2000
+  # 动态仓位: atr(基于 ATR) 或 kelly(基于凯利公式)
+  position_sizing: atr
+
+# ==================== 风控配置 ====================
+risk:
+  # 单票止损/止盈 (%)
+  stop_loss_pct: -8
+  take_profit_pct: 10
+  # 持仓天数上限
+  max_holding_days: 20
+  # 账户级日最大回撤 (%)
+  max_daily_drawdown: -3
+  # 最大持仓总亏损占比
+  max_total_loss_pct: -10
+  # 是否启用风控熔断 (true/false)
+  circuit_breaker: true
+
+# ==================== 模拟盘参数 ====================
+simulation:
+  commission_rate: 0.00025    # 佣金万分之2.5
+  min_commission: 5           # 最低佣金 5 元
+  stamp_tax_rate: 0.001       # 印花税千分之一 (卖出)
+  transfer_fee_rate: 0.00001  # 过户费十万分之一
+  slippage_pct: 0.1           # 滑点百分比
+  # 模拟盘是否使用真实行情 (true=腾讯实时, false=模拟数据)
+  use_realtime: true
+
+# ==================== 实盘参数 ====================
+live:
+  # 同花顺/通达信通用
+  max_order_count: 10         # 单次最多下单数
+  retry_count: 3              # 下单重试次数
+  retry_interval: 1           # 重试间隔 (秒)
+  
+  # 委托价格策略: 0=现价 1=买一价 2=卖一价 3=最优价
+  price_strategy: 0
+  
+  # 订单超时 (秒)，超时未成交自动撤单
+  order_timeout: 30
+  
+  # 实盘手续费 (参考值，实际以券商为准)
+  commission_rate: 0.00025    # 佣金万分之2.5
+  min_commission: 5           # 最低佣金 5 元
+  stamp_tax_rate: 0.001       # 印花税 (卖出)
+  transfer_fee_rate: 0.00001  # 过户费
+  
+  # 实盘滑点 (元)
+  slippage: 0.01
+
+# ==================== QMT 实盘配置 ====================
+# 注意：敏感信息如 account_id 建议通过 .env 文件配置
+qmt:
+  account_id: ""              # 资金账号 (建议从 .env 读取: QMT_ACCOUNT_ID)
+  mini_qmt_path: ""           # QMT userdata 路径 (建议从 .env 读取: QMT_MINI_QMT_PATH)
+
+# ==================== LLaMA 模型配置 ====================
+llama:
+  server_path: ""             # llama-server.exe 路径 (建议从 .env 读取: LLAMA_SERVER_PATH)
+  models:
+    qwen_uncensored:
+      model_path: ""          # 模型路径 (建议从 .env 读取: LLAMA_MODEL_UNCERTAINED)
+      ctx_size: 32768
+      n_batch: 512
+      n_ubatch: 512
+      n_gpu_layers: 32
+    qwen_normal:
+      model_path: ""          # 模型路径 (建议从 .env 读取: LLAMA_MODEL_NORMAL)
+      ctx_size: 131072
+      n_batch: 8192
+      n_ubatch: 8192
+      n_gpu_layers: 26
+
+# ==================== 券商路径 ====================
+# auto = 自动检测，也可指定绝对路径
+easytrader_path: auto
+tdx_path: auto
+
+# ==================== 通知配置 ====================
+notify:
+  webhook: ""                 # 企业微信/飞书机器人 webhook
+  telegram_token: ""
+  chat_id: ""
+
+# ==================== Cron 轮询 (秒) ====================
+poll_interval: 300
