@@ -1357,6 +1357,88 @@ def module_system_logs():
             st.error(f"读取日志失败: {e}")
 
 
+def module_paper_trading_monitor():
+    st.header("📈 Paper Trading 监控与审计大屏")
+    st.markdown("监控最近 5 个交易日的实盘试运行情况，验证全链路风控与信号流转是否符合预期。")
+    
+    keywords = [
+        "[TRADE_TRACE]",
+        "[RISK_GATE_BLOCK]",
+        "[CONSERVATIVE_VETO]",
+        "[STALE_EVENT_BLOCK]",
+        "[TRADING_STATE_UNAVAILABLE]",
+        "[INDEX_CACHE_STALE]",
+        "[PROVIDER_FAILOVER]",
+        "[EVENT_CARD_STALE]"
+    ]
+    
+    fatal_keywords = [
+        "FOLLOW_RULE_ONLY",
+        "Unknown final action"
+    ]
+    
+    # 扫描最近5天的日志
+    log_files = []
+    if LOGS_DIR.exists():
+        log_files = sorted(LOGS_DIR.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
+    
+    if not log_files:
+        st.warning("暂无日志文件可供分析。")
+        return
+        
+    st.subheader("关键词命中统计")
+    
+    results = {k: 0 for k in keywords}
+    fatal_hits = {k: [] for k in fatal_keywords}
+    
+    # 我们只扫描最近的几个日志文件以提高性能
+    for log_path in log_files[:5]:
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                for line_num, line in enumerate(f, 1):
+                    for k in keywords:
+                        if k in line:
+                            results[k] += 1
+                    for fk in fatal_keywords:
+                        if fk in line:
+                            fatal_hits[fk].append(f"{log_path.name}:{line_num} -> {line.strip()}")
+        except Exception as e:
+            continue
+            
+    col1, col2, col3, col4 = st.columns(4)
+    cols = [col1, col2, col3, col4]
+    
+    explanations = {
+        "[TRADE_TRACE]": "每笔成交的四段审计绑定，必须完整。",
+        "[RISK_GATE_BLOCK]": "风控闸门拦截记录，拦截高危交易。",
+        "[CONSERVATIVE_VETO]": "LLM 超时/异常触发，阻断交易。",
+        "[STALE_EVENT_BLOCK]": "陈旧资讯被拦截，防误导。",
+        "[TRADING_STATE_UNAVAILABLE]": "状态获取失败触发 Fail-close。",
+        "[INDEX_CACHE_STALE]": "大盘缓存超时提醒，进入保守模式。",
+        "[PROVIDER_FAILOVER]": "资讯源切换，保障高可用。",
+        "[EVENT_CARD_STALE]": "事件卡片新鲜度警告。"
+    }
+    
+    for i, (k, count) in enumerate(results.items()):
+        with cols[i % 4]:
+            st.metric(k, count, help=explanations.get(k, ""))
+            
+    st.markdown("---")
+    st.subheader("🔴 致命异常扫描 (Dead Branch Detection)")
+    st.markdown("检查代码清理后是否仍有残留的死逻辑被意外触发：")
+    
+    has_fatal = False
+    for fk, hits in fatal_hits.items():
+        if hits:
+            has_fatal = True
+            st.error(f"**检测到 {fk} 异常记录！**")
+            with st.expander("展开查看详情"):
+                for h in hits:
+                    st.code(h)
+                    
+    if not has_fatal:
+        st.success("✅ 未检测到 FOLLOW_RULE_ONLY 或 Unknown final action 日志。系统执行路径洁净。")
+
 def main():
     """主入口"""
     st.title("🚀 AI Trader 量化系统控制台")
@@ -1365,7 +1447,7 @@ def main():
     st.sidebar.title("导航菜单")
     selected_module = st.sidebar.radio(
         "选择模块",
-        ["📊 资产监控大屏", "📋 自选股管理", "📜 系统运行日志", "📜 历史复盘"],
+        ["📊 资产监控大屏", "📈 Paper Trading 监控", "📋 自选股管理", "📜 系统运行日志", "📜 历史复盘"],
         index=0
     )
 
@@ -1384,6 +1466,8 @@ def main():
     # 根据选择显示对应模块
     if selected_module == "📊 资产监控大屏":
         module_portfolio_dashboard()
+    elif selected_module == "📈 Paper Trading 监控":
+        module_paper_trading_monitor()
     elif selected_module == "📋 自选股管理":
         module_watchlist_manager()
     elif selected_module == "📜 系统运行日志":

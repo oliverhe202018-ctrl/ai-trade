@@ -217,7 +217,12 @@ def process_trade_signal_message(topic, payload):
         
     order["order_id"] = order.get("order_id", trade_id)
     
-    current_state = get_trading_state()
+    try:
+        current_state = get_trading_state()
+    except Exception as e:
+        logger.error(f"[TRADING_STATE_UNAVAILABLE] Failed to get trading state: {e}")
+        return
+        
     if not final_execution_gate(order, current_state, order.get("source", "TRADE_SIGNAL")):
         return
     
