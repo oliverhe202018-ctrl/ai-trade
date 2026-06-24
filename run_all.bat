@@ -36,7 +36,7 @@ echo [6/9] Starting Event Extractor...
 start "Event Extractor" cmd /k "%PYTHON_CMD% nlp\event_extractor.py || echo [STARTUP_FAIL] event_extractor failed && pause"
 
 echo [7/9] Starting Agent Daemon...
-start "Agent Daemon" cmd /k "python core\agent_daemon.py || echo [STARTUP_FAIL] agent_daemon failed && pause"
+start "Agent Daemon" cmd /k "%PYTHON_CMD% core\agent_daemon.py || echo [STARTUP_FAIL] agent_daemon failed && pause"
 timeout /t 3 /nobreak >nul
 
 echo [8/9] Starting Web Dashboard...
@@ -57,12 +57,12 @@ for /f "tokens=1-2 delims=:" %%a in ("%time%") do (
 
 :: 9:30 - 14:55 Trade Logic
 if %current_time% geq 930 if %current_time% leq 1455 (
-    c:\users\a2515\appdata\local\hermes\hermes-agent\venv\Scripts\python.exe live_trader.py
+    %PYTHON_CMD% live_trader.py
 )
 
 :: 15:00 Daily Settlement
 if %current_time% geq 1500 if %current_time% leq 1505 (
-    python daily_settlement.py
+    %PYTHON_CMD% daily_settlement.py
     exit
 )
 
