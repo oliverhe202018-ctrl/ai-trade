@@ -97,6 +97,10 @@ def execute_single_order(order):
     decision_id = order.get("decision_id", "")
     event_ids = order.get("event_ids", [])
     source = order.get("source", "unknown")
+    trade_id = order.get("trade_id", "")
+    
+    if not trade_id:
+        logger.warning(f"[TRADE_TRACE_MISSING_TRADE_ID] {action} {code} missing trade_id")
 
     price_type = "限价" if fill_price > 0 else "市价"
     
@@ -113,6 +117,7 @@ def execute_single_order(order):
         import json
         audit_log = {
             "order_id": order_id,
+            "trade_id": trade_id,
             "decision_id": decision_id,
             "event_ids": event_ids,
             "source": source,

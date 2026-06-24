@@ -214,8 +214,14 @@ def final_risk_gate(symbol, action, market_data, events=None, portfolio=None, de
         try:
             evs = json.loads(events) if isinstance(events, str) else events
             for e in evs:
-                if e.get('stale') is True:
+                stale_val = e.get('stale')
+                if stale_val in [True, 1, "1", "true", "True", "TRUE", "yes", "YES", "y", "Y"]:
                     return _block("Stale event detected")
+                elif stale_val in [False, 0, "0", "false", "False", "FALSE", None, ""]:
+                    pass
+                else:
+                    logger.warning(f"[STALE_EVENT_BLOCK] Unknown stale type: {type(stale_val)} value: {stale_val}")
+                    return _block("Invalid stale flag")
         except Exception as ex:
             return _block(f"Event parsing failed: {ex}")
             
@@ -223,10 +229,12 @@ def final_risk_gate(symbol, action, market_data, events=None, portfolio=None, de
         return _block("Portfolio is missing, cannot verify position limits")
         
     try:
-        if get_trading_state() == TradingState.FROZEN.value:
-            return _block("System is FROZEN")
+        current_state = get_trading_state()
+        if current_state in [TradingState.FROZEN.value, TradingState.EMERGENCY.value, "FROZEN", "EMERGENCY"]:
+            return _block(f"System state is {current_state}")
     except Exception as e:
-        logger.error(f"[RISK_GATE_BLOCK] Failed to get trading state: {e}")
+        logger.error(f"[RISK_GATE_BLOCK] [TRADING_STATE_UNAVAILABLE] Failed to get trading state: {e}")
+        return _block("Trading state unavailable")
         
     params = _load_hyperparams()
     max_position_pct = params.get('max_single_pct', 0.15)

@@ -72,8 +72,12 @@ def update_cache():
         logger.error(f"[INDEX_CACHE_UPDATE_FAIL] Failed to update index cache: {e}")
 
 def main():
+    import os
+    env_interval = os.environ.get("INDEX_CACHE_UPDATE_INTERVAL_SECONDS", "")
+    default_interval = int(env_interval) if env_interval.isdigit() else 300
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--interval", type=int, default=60, help="Update interval in seconds")
+    parser.add_argument("--interval", type=int, default=default_interval, help="Update interval in seconds")
     args = parser.parse_args()
     
     logger.info(f"Starting Index Cache Updater... Update interval: {args.interval}s")

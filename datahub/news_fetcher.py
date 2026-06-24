@@ -184,7 +184,9 @@ def fetch_worker(provider, symbol, timeout=15):
                     raise
 
 def get_held_stocks():
-    default_watchlist = ["600519", "000858", "000001"]
+    fallback_env = os.getenv("NEWS_FALLBACK_WATCHLIST", "")
+    default_watchlist = [s.strip() for s in fallback_env.split(",")] if fallback_env else []
+    
     try:
         portfolio = load_portfolio()
         if portfolio and "positions" in portfolio and portfolio["positions"]:
@@ -192,10 +194,13 @@ def get_held_stocks():
             logger.info(f"[HELD_STOCKS_FROM_PORTFOLIO] 成功挂载真实持仓池，共 {len(live_stocks)} 只标的")
             return live_stocks
         else:
-            logger.warning("[HELD_STOCKS_FALLBACK] 真实持仓为空，退化降级至系统级后备观察名单")
+            if default_watchlist:
+                logger.warning("[HELD_STOCKS_FALLBACK] 真实持仓为空，退化降级至系统级后备观察名单")
+            else:
+                logger.warning("[HELD_STOCKS_FALLBACK] 真实持仓为空且未配置 NEWS_FALLBACK_WATCHLIST，跳过本轮抓取")
             return default_watchlist
     except Exception as e:
-        logger.error(f"[HELD_STOCKS_FALLBACK] 加载真实持仓发生异常: {e}，强制启用安全后备名单")
+        logger.error(f"[HELD_STOCKS_FALLBACK] 加载真实持仓发生异常: {e}，强制启用安全后备名单" if default_watchlist else f"[HELD_STOCKS_FALLBACK] 加载真实持仓发生异常: {e}，且无配置后备名单")
         return default_watchlist
 
 def scheduler_loop():
