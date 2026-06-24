@@ -166,7 +166,7 @@ def worker_process_raw_news():
         try:
             with get_db_conn() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT id, symbol, title, content, publish_time, created_at, provider, raw_data, content_hash FROM raw_news WHERE status = 'raw' LIMIT 50")
+                cursor.execute("SELECT id, symbol, title, content, publish_time, created_at, provider, raw_data, content_hash, source_url FROM raw_news WHERE status = 'raw' LIMIT 50")
                 rows = cursor.fetchall()
                 
                 if not rows:
@@ -183,8 +183,9 @@ def worker_process_raw_news():
                     provider = row['provider']
                     raw_data = row['raw_data']
                     content_hash = row['content_hash']
+                    db_source_url = row['source_url'] if 'source_url' in row.keys() else None
                     
-                    source_url = extract_source_url(raw_data)
+                    source_url = db_source_url if db_source_url else extract_source_url(raw_data)
                     if not source_url:
                         logger.info(f"[EVENT_SOURCE_URL_MISSING] Source URL not found for news_id {news_id}")
                         

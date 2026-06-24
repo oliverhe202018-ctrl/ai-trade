@@ -22,6 +22,8 @@ def init_db():
                 publish_time DATETIME NOT NULL,
                 provider TEXT NOT NULL,
                 raw_data TEXT,
+                status TEXT DEFAULT 'raw',
+                source_url TEXT DEFAULT '',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(symbol, content_hash)
             )
@@ -38,6 +40,22 @@ def init_db():
             except Exception as e:
                 import logging
                 logging.getLogger(__name__).warning(f"Migration failed for raw_news content_hash: {e}")
+                
+        if "status" not in raw_news_columns:
+            try:
+                cursor.execute("ALTER TABLE raw_news ADD COLUMN status TEXT DEFAULT 'raw'")
+                cursor.execute("UPDATE raw_news SET status = 'raw' WHERE status IS NULL")
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).error(f"Critical migration failed for raw_news status: {e}")
+                raise
+
+        if "source_url" not in raw_news_columns:
+            try:
+                cursor.execute("ALTER TABLE raw_news ADD COLUMN source_url TEXT DEFAULT ''")
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Migration failed for raw_news source_url: {e}")
                 
         cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_news_symbol_content_hash ON raw_news(symbol, content_hash)')
         

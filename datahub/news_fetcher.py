@@ -150,7 +150,7 @@ class LocalCacheProvider(NewsProvider):
                 cutoff_time = (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
                 
                 cursor.execute('''
-                    SELECT title, content, publish_time, raw_data 
+                    SELECT title, content, publish_time, raw_data, source_url 
                     FROM raw_news 
                     WHERE symbol = ? AND publish_time >= ?
                     ORDER BY publish_time DESC LIMIT 10
@@ -164,7 +164,7 @@ class LocalCacheProvider(NewsProvider):
                         'content': row[1],
                         'publish_time': row[2],
                         'provider': self.name,
-                        'source_url': '',
+                        'source_url': row[4] if len(row) > 4 else '',
                         'raw_data': row[3]
                     })
         except Exception as e:
@@ -174,11 +174,33 @@ class LocalCacheProvider(NewsProvider):
 
 def save_news(symbol, provider_name, news_items):
     import re
+    import json
     def _normalize(text):
         text = text or ""
         text = re.sub(r'<[^>]+>', '', text)
         return re.sub(r'\s+', ' ', text).strip()
         
+    def extract_source_url(item):
+        if item.get("source_url"):
+            return item["source_url"]
+        raw_data = item.get("raw_data")
+        if raw_data:
+            if isinstance(raw_data, str):
+                try:
+                    data = json.loads(raw_data)
+                except Exception:
+                    data = {}
+            elif isinstance(raw_data, dict):
+                data = raw_data
+            else:
+                data = {}
+                
+            if isinstance(data, dict):
+                for key in ['url', 'source_url', 'link', '新闻链接']:
+                    if key in data and data.get(key):
+                        return str(data[key])
+        return ""
+
     with get_db_conn() as conn:
         cursor = conn.cursor()
         for item in news_items:
@@ -186,6 +208,7 @@ def save_news(symbol, provider_name, news_items):
                 title = item.get('title', '').strip()
                 content = item.get('content', '').strip()
                 publish_time = item.get('publish_time', '')
+                source_url = extract_source_url(item)
                 
                 if content:
                     norm = _normalize(content)
@@ -196,8 +219,8 @@ def save_news(symbol, provider_name, news_items):
                     content_hash = hashlib.md5(weak_str.encode('utf-8')).hexdigest()
                 
                 cursor.execute('''
-                    INSERT INTO raw_news (symbol, title, content, content_hash, publish_time, provider, raw_data)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO raw_news (symbol, title, content, content_hash, publish_time, provider, raw_data, status, source_url)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'raw', ?)
                 ''', (
                     symbol, 
                     title, 
@@ -205,7 +228,8 @@ def save_news(symbol, provider_name, news_items):
                     content_hash,
                     publish_time, 
                     provider_name,
-                    item.get('raw_data', '{}')
+                    item.get('raw_data', '{}'),
+                    source_url
                 ))
             except sqlite3.IntegrityError as e:
                 logger.info(f"Hash conflict or duplicate skipped for symbol={symbol}, title={item.get('title')}: {e}")
@@ -253,6 +277,41 @@ def get_held_stocks():
         logger.error(f"[HELD_STOCKS_FALLBACK] 加载真实持仓发生异常: {e}，强制启用安全后备名单" if default_watchlist else f"[HELD_STOCKS_FALLBACK] 加载真实持仓发生异常: {e}，且无配置后备名单")
         return default_watchlist
 
+def process_symbol_with_providers(symbol, providers, circuit_breaker):
+    fetch_success = False
+    for provider in providers:
+        if not circuit_breaker.allow(provider.name):
+            logger.warning(f"[PROVIDER_FAILOVER] Circuit breaker open for {provider.name}, skipping.")
+            continue
+            
+        status, data = fetch_worker(provider, symbol, timeout=20)
+        
+        if status == "SUCCESS_WITH_DATA":
+            circuit_breaker.success(provider.name)
+            save_news(symbol, provider.name, data)
+            logger.info(f"Saved {len(data)} news items for {symbol} from {provider.name}.")
+            fetch_success = True
+            break
+        elif status == "SUCCESS_NO_DATA":
+            logger.info(f"[PROVIDER_NO_DATA] {provider.name} returned empty news for {symbol}.")
+            if provider.name == "local_cache":
+                logger.warning(f"[NEWS_FETCH_DEGRADED] local cache also empty for {symbol}")
+                fetch_success = False
+                break
+            else:
+                logger.info(f"[PROVIDER_NO_DATA_CONTINUE_FALLBACK] Continuing to next provider for {symbol}.")
+                continue
+        elif status == "FAILED":
+            circuit_breaker.failure(provider.name)
+            logger.error(f"[PROVIDER_FAILOVER] Fetch failed for {provider.name} on {symbol}")
+            continue
+            
+    if not fetch_success:
+        logger.warning(f"[NEWS_FETCH_DEGRADED] All providers failed or empty for {symbol}.")
+        
+    return fetch_success
+
+
 def scheduler_loop():
     init_db()
     import random
@@ -265,31 +324,7 @@ def scheduler_loop():
         try:
             symbols = get_held_stocks()
             for symbol in symbols:
-                fetch_success = False
-                
-                for provider in providers:
-                    if not circuit_breaker.allow(provider.name):
-                        logger.warning(f"[PROVIDER_FAILOVER] Circuit breaker open for {provider.name}, skipping.")
-                        continue
-                        
-                    status, data = fetch_worker(provider, symbol, timeout=20)
-                    
-                    if status == "SUCCESS_WITH_DATA":
-                        circuit_breaker.success(provider.name)
-                        save_news(symbol, provider.name, data)
-                        logger.info(f"Saved {len(data)} news items for {symbol} from {provider.name}.")
-                        fetch_success = True
-                        break
-                    elif status == "SUCCESS_NO_DATA":
-                        logger.info(f"[PROVIDER_NO_DATA] {provider.name} returned empty news for {symbol}.")
-                        fetch_success = True
-                        break
-                    elif status == "FAILED":
-                        circuit_breaker.failure(provider.name)
-                        logger.error(f"[PROVIDER_FAIL] Fetch failed for {provider.name} on {symbol}")
-                        
-                if not fetch_success:
-                    logger.warning(f"[NEWS_FETCH_DEGRADED] All providers failed for {symbol}.")
+                process_symbol_with_providers(symbol, providers, circuit_breaker)
             
         except Exception as e:
             logger.error(f"Scheduler loop error: {e}")
