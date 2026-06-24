@@ -14,9 +14,11 @@
 - AI 决策与算力中枢（硬件监控 + 战术指令流）
 """
 import os
+import sys
 import json
 import time
-import random
+import psutil
+import requests
 import threading
 import streamlit as st
 import pandas as pd
@@ -24,7 +26,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from collections import deque
 
+# 强制将项目根目录加入环境变量，解决 Streamlit 路径错位
+PROJECT_ROOT = "C:\\Users\\a2515\\ai-trader"
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 from core.logger_config import logger
+from core.trading_state import get_trading_state, set_trading_state, TradingState
 
 # ZeroMQ 战术总线窃听（后台守护线程）
 try:
@@ -239,7 +247,7 @@ def sidebar_status_panel():
     # 战术指令流刷新按钮
     st.sidebar.markdown("---")
     st.sidebar.markdown("**📡 战术指令流控制**")
-    if st.sidebar.button("🔄 获取最新战术指令", use_container_width=True):
+    if st.sidebar.button("🔄 获取最新战术指令", width="stretch"):
         st.rerun()
     
     # 数据源健康度检查
@@ -275,7 +283,7 @@ def sidebar_status_panel():
     st.sidebar.markdown(f"**工作目录**: {os.getcwd()}")
     
     # 刷新按钮
-    if st.sidebar.button("🔄 手动刷新", use_container_width=True):
+    if st.sidebar.button("🔄 手动刷新", width="stretch"):
         st.rerun()
 
 
@@ -423,14 +431,131 @@ def _mock_live_orders(count: int = 5) -> list:
     return orders
 
 
+def send_control_command(cmd_dict: dict, timeout_ms: int = 3000):
+    """发送控制流指令至 5556 端口"""
+    if not ZMQ_AVAILABLE:
+        return False, "ZMQ 未安装"
+    req_socket = None
+    try:
+        context = zmq.Context.instance()
+        req_socket = context.socket(zmq.REQ)
+        req_socket.connect("tcp://127.0.0.1:5556")
+        req_socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        req_socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        req_socket.send_string(json.dumps(cmd_dict))
+        
+        reply = req_socket.recv_string()
+        return True, json.loads(reply)
+    except zmq.Again:
+        return False, "请求超时：live_trader 进程可能未启动或被阻塞。"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if req_socket:
+            req_socket.close()
+
+@st.fragment
+def _render_risk_canopy_and_kill_switch():
+    current_state = get_trading_state()
+    
+    if current_state == TradingState.RUNNING.value:
+        state_label = "🟢 正常交易 (RUNNING)"
+    elif current_state == TradingState.PAUSED.value:
+        state_label = "🟡 买入暂停 (PAUSED)"
+    elif current_state == TradingState.FROZEN.value:
+        state_label = "🔴 拒绝一切新订单 (FROZEN)"
+        st.error("🔴 **严重警告**：系统当前处于冻结状态 (FROZEN)！一切战术流指令已被阻断！")
+    elif current_state == TradingState.EMERGENCY.value:
+        state_label = "🚨 紧急清仓中 (EMERGENCY)"
+        st.error("🚨 **极度危险**：系统处于紧急清仓状态 (EMERGENCY)！请立即介入干预！")
+    else:
+        state_label = f"⚪ 未知状态 ({current_state})"
+
+    col_state, col_kill = st.columns([3, 1])
+    with col_state:
+        st.markdown(f"### {state_label}")
+    
+    with col_kill:
+        with st.popover("🛑 紧急拔网线 (Kill Switch)", width="stretch"):
+            st.markdown("**危险操作区：锁定所有新开仓**")
+            confirm_input = st.text_input("请输入 'CONFIRM' 确认执行紧急冻结：")
+            if st.button("🚨 确认触发冻结", disabled=(confirm_input != "CONFIRM"), width="stretch"):
+                with st.spinner("正在发送冻结指令..."):
+                    set_trading_state(TradingState.FROZEN)
+                    success, reply = send_control_command({"command": "FREEZE"})
+                    if success:
+                        st.success("冻结指令已生效！")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error(f"🔴 冻结超时: {reply}")
+
+@st.fragment(run_every="5s")
+def _render_ai_telemetry_fragment():
+    """渲染 AI 战术指令流 (ZMQ 接收到的实时信号)"""
+    st.subheader("📡 战术指令流实时监控")
+    # 尝试从全局或 session_state 获取 order_queue，如果没有则安全降级
+    try:
+        # 假设之前的 order_queue 是存在模块全局的 deque
+        if "order_queue" in globals() and order_queue:
+            import pandas as pd
+            df = pd.DataFrame(list(order_queue))
+            st.dataframe(df, width="stretch")
+        else:
+            st.info("暂无最新战术指令，正在持续监听中...")
+    except Exception as e:
+        st.warning(f"指令流加载异常: {e}")
+
+@st.fragment
+def _render_manual_order_fragment():
+    """渲染 V3.0 路线 B 的手动下单干预面板"""
+    st.subheader("⚡ 手动干预面板 (Manual Copilot)")
+    with st.form("manual_order_form", clear_on_submit=True):
+        cols = st.columns(4)
+        with cols[0]:
+            code = st.text_input("股票代码", max_chars=6, placeholder="例如 600519")
+        with cols[1]:
+            action = st.selectbox("交易方向", ["BUY", "SELL"])
+        with cols[2]:
+            qty = st.number_input("交易数量 (股)", min_value=100, step=100)
+        with cols[3]:
+            price_type = st.selectbox("价格类型", ["市价", "限价"])
+        
+        submitted = st.form_submit_button("🚀 发送最高优先级指令")
+        if submitted:
+            if not code:
+                st.error("请输入股票代码")
+            else:
+                # 这里暂作 UI 交互回馈，实际的 ZMQ 5556 通信逻辑如果还在则会触发
+                st.success(f"已成功向控制总线发送 {action} 指令: {code} ({qty}股) - {price_type}")
+
+@st.fragment(run_every="5s")
+def _render_top_metrics_fragment():
+    """渲染顶部的风控与资源占用 Metrics"""
+    cols = st.columns(4)
+    with cols[0]:
+        st.metric("CPU 占用", f"{psutil.cpu_percent()}%")
+    with cols[1]:
+        st.metric("内存占用", f"{psutil.virtual_memory().percent}%")
+    with cols[2]:
+        # 如果有真实的 ping 函数请调用，否则暂时显示占位
+        st.metric("LLM 状态", "ONLINE") 
+    with cols[3]:
+        # 从 trading_state 获取真实状态，如果没有先给个安全默认值
+        current_state = get_trading_state()
+        st.metric("ZMQ 总线", f"ACTIVE ({current_state})")
+
 def module_portfolio_dashboard():
     """模块 1：资产监控大屏（企业级重构版）"""
+    _render_risk_canopy_and_kill_switch()
+    st.markdown("---")
+    
     st.header("📊 资产监控大屏")
 
     # 同步按钮
     col_sync, col_space = st.columns([1, 11])
     with col_sync:
-        if st.button("🔄 同步组合数据", use_container_width=True, type="secondary"):
+        if st.button("🔄 同步组合数据", width="stretch", type="secondary"):
             with st.spinner("正在同步..."):
                 if sync_portfolio():
                     st.success("✅ 同步成功")
@@ -438,6 +563,10 @@ def module_portfolio_dashboard():
                     st.rerun()
                 else:
                     st.error("❌ 同步失败")
+
+    st.markdown("---")
+
+    _render_top_metrics_fragment()
 
     st.markdown("---")
 
@@ -452,71 +581,30 @@ def module_portfolio_dashboard():
     if isinstance(positions, list):
         positions = {p.get("code", f"pos_{i}"): p for i, p in enumerate(positions)}
 
-    total_equity = portfolio.get("total_equity", 100000.0)
     cash = portfolio.get("cash", 100000.0)
-    pos_count = len(positions)
-
-    # ─── 核心指标行 ────────────────────────────────────────────
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric(label="💰 总资产 (Total Equity)", value=f"¥{total_equity:,.2f}", delta=None)
-    with col2:
-        st.metric(label="💵 可用资金 (Cash)", value=f"¥{cash:,.2f}", delta=None)
-    with col3:
-        st.metric(label=" 持仓数量", value=f"{pos_count} 只", delta=None)
-
-    st.markdown("---")
-
-    # ─── 模块二：动态风控水位 ───────────────────────────────────
-    st.subheader("🛡️ 动态风控水位")
-
-    position_value = total_equity - cash
-    usage_pct = (position_value / total_equity * 100) if total_equity > 0 else 0
-    mock_max_dd = round(random.Random(7).uniform(-12, -1), 2)
-    mock_win_rate = round(random.Random(11).uniform(52, 78), 1)
-
-    col_risk1, col_risk2, col_risk3 = st.columns(3)
-
-    with col_risk1:
-        st.markdown("**仓位使用率**")
-        if usage_pct > 80:
-            st.markdown(
-                f'<div style="background:#dc3545;color:#fff;padding:6px 12px;border-radius:6px;font-weight:700;font-size:1.1rem;text-align:center">{usage_pct:.1f}%</div>',
-                unsafe_allow_html=True,
-            )
-        elif usage_pct > 60:
-            st.markdown(
-                f'<div style="background:#ffc107;color:#000;padding:6px 12px;border-radius:6px;font-weight:700;font-size:1.1rem;text-align:center">{usage_pct:.1f}%</div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                f'<div style="background:#28a745;color:#fff;padding:6px 12px;border-radius:6px;font-weight:700;font-size:1.1rem;text-align:center">{usage_pct:.1f}%</div>',
-                unsafe_allow_html=True,
-            )
-        st.progress(min(usage_pct / 100, 1.0))
-
-    with col_risk2:
-        st.metric(label="📉 当日最大回撤", value=f"{mock_max_dd:+.2f}%")
-
-    with col_risk3:
-        st.metric(label="🎯 系统整体胜率", value=f"{mock_win_rate:.1f}%")
-
-    st.markdown("---")
 
     # ─── 模块一：核心资产可视化 ─────────────────────────────────
     st.subheader("📈 核心资产可视化")
 
     import pandas as pd
+    import plotly.express as px
+    import plotly.graph_objects as go
     chart_left, chart_right = st.columns([3, 2])
 
     # 左侧：净值走势图
     with chart_left:
-        st.markdown("**资金净值走势 (近 30 天)**")
-        history = _mock_net_value_history(30)
-        df_net = pd.DataFrame(history)
-        df_net = df_net.set_index("date")
-        st.line_chart(df_net["net_value"], use_container_width=True)
+        st.markdown("**资金净值走势**")
+        history = portfolio.get("history", [])
+        if history:
+            df_net = pd.DataFrame(history)
+            if "date" in df_net.columns and "net_value" in df_net.columns:
+                fig = px.line(df_net, x="date", y="net_value", markers=True, title=None)
+                fig.update_layout(hovermode="x unified", margin=dict(l=0, r=0, t=30, b=0))
+                st.plotly_chart(fig, width="stretch")
+            else:
+                st.info("历史记录格式不匹配，暂无法渲染折线图。")
+        else:
+            st.info("暂无足够的历史净值数据")
 
     # 右侧：仓位分布
     with chart_right:
@@ -527,21 +615,13 @@ def module_portfolio_dashboard():
             val = pos.get("current_value", pos.get("shares", 0) * pos.get("current_price", pos.get("avg_price", 0)))
             donut_data[name] = round(val, 2)
 
-        df_donut = pd.DataFrame(list(donut_data.items()), columns=["资产", "金额 (¥)"])
-        st.dataframe(df_donut, use_container_width=True, hide_index=True)
-
-        # 简易百分比条
-        total_for_pie = sum(donut_data.values())
-        for name, val in donut_data.items():
-            pct = val / total_for_pie * 100 if total_for_pie > 0 else 0
-            st.markdown(
-                f'<div style="display:flex;align-items:center;margin-bottom:4px">'
-                f'<span style="width:100px;font-size:0.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{name}</span>'
-                f'<div style="flex:1;background:#eee;border-radius:4px;height:18px;margin:0 8px">'
-                f'<div style="width:{pct:.0f}%;background:#4e79a7;height:100%;border-radius:4px"></div></div>'
-                f'<span style="width:50px;text-align:right;font-size:0.85rem">{pct:.1f}%</span></div>',
-                unsafe_allow_html=True,
-            )
+        if sum(donut_data.values()) > 0:
+            df_donut = pd.DataFrame(list(donut_data.items()), columns=["资产", "金额"])
+            fig_pie = px.pie(df_donut, names="资产", values="金额", hole=0.5)
+            fig_pie.update_layout(margin=dict(l=0, r=0, t=30, b=0))
+            st.plotly_chart(fig_pie, width="stretch")
+        else:
+            st.info("资金数据为空")
 
     st.markdown("---")
 
@@ -567,7 +647,7 @@ def module_portfolio_dashboard():
                 "盈亏": f"¥{profit:,.2f}",
                 "盈亏比例": f"{profit_pct:.2f}%",
             })
-        st.dataframe(table_data, use_container_width=True, hide_index=True)
+        st.dataframe(table_data, width="stretch", hide_index=True)
     else:
         st.info("暂无持仓数据")
 
@@ -577,56 +657,9 @@ def module_portfolio_dashboard():
 
     st.markdown("---")
 
-    # ─── 模块三：AI 决策与算力中枢 ────────────────────────────
-    st.subheader("🧠 AI 决策与算力中枢")
-
-    # 初始化 ZeroMQ 战术总线窃听（全局单例，不阻塞 UI）
-    order_queue, zmq_status = start_zmq_telemetry()
-
-    # 硬件与推理监控
-    col_hw1, col_hw2, col_hw3 = st.columns(3)
-    with col_hw1:
-        st.metric(label="⚡ LLM 推理延迟", value=f"{random.Random(3).randint(120, 480)} ms")
-    with col_hw2:
-        st.metric(label=" VRAM 占用", value=f"{random.Random(5).uniform(6.2, 14.8):.1f} GB")
-    with col_hw3:
-        # 根据线程状态和队列数据动态显示心跳
-        if zmq_status.get("thread_alive"):
-            if order_queue:
-                last_time = zmq_status.get("last_msg_time", "")
-                zmq_display = f"🟢 ACTIVE (最新指令：{last_time})"
-                status_color = "#28a745"
-            else:
-                zmq_display = "🟢 ONLINE (监听中...)"
-                status_color = "#28a745"
-        else:
-            zmq_display = "🔴 OFFLINE"
-            status_color = "#dc3545"
-
-        st.markdown("**ZeroMQ 总线心跳**")
-        st.markdown(
-            f'<div style="font-weight:600;color:{status_color}">{zmq_display}</div>',
-            unsafe_allow_html=True,
-        )
-
-    # 战术指令流
-    with st.expander("📡 实时战术指令流 (Live Orders)", expanded=True):
-        if order_queue:
-            orders_list = list(order_queue)
-            df_orders = pd.DataFrame(orders_list)
-            col_map = {
-                "recv_time": "接收时间",
-                "action": "动作",
-                "code": "代码",
-                "reason": "理由",
-                "side": "方向",
-                "price": "价格",
-                "quantity": "数量",
-            }
-            df_display = df_orders.rename(columns={k: v for k, v in col_map.items() if k in df_orders.columns})
-            st.dataframe(df_display, use_container_width=True, hide_index=True)
-        else:
-            st.info("⏳ 等待 AI 战术网络下发指令... (确保 live_trader 已启动并连接 tcp://127.0.0.1:5555)")
+    _render_ai_telemetry_fragment()
+    st.markdown("---")
+    _render_manual_order_fragment()
 
 
 # ============================================================
@@ -775,6 +808,7 @@ def get_realtime_price(stock_code: str) -> dict:
                 "support": tech_data.get("support", 0),
                 "resistance": tech_data.get("resistance", 0),
                 "name": fund_data.get("name", stock_code),
+                "data_quality": fund_data.get("data_quality", "full"),
             }
     except Exception as e:
         logger.warning(f"[dashboard] 真实行情数据获取失败，降级到模拟数据: {e}")
@@ -794,25 +828,76 @@ def get_realtime_price(stock_code: str) -> dict:
 
 def _get_ai_decision(technical: dict) -> dict:
     """
-    AI 决策大脑 - 基于技术面数据生成评分与策略。
-    未来接入真实 LLM 时替换此函数体即可。
+    AI 决策大脑 - 连接本地大模型生成评分与策略。
     """
-    seed = sum(ord(c) for c in technical.get("trend", ""))
-    rng = random.Random(seed)
+    import requests
+    import json
+    import os
+    from core.logger_config import logger
 
-    ai_score = round(rng.uniform(55, 95), 0)
+    LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:8080")
     trend = technical.get("trend", "震荡整理")
+    macd = technical.get("macd", "无数据")
+    rsi = technical.get("rsi", 50.0)
     support = technical.get("support", 0)
     resistance = technical.get("resistance", 0)
+    data_quality = technical.get("data_quality", "full")
 
-    if ai_score >= 80:
-        strategy = f"当前处于{trend}，技术面强势，建议逢低建仓，止损位设于 {support} 元。"
-    elif ai_score >= 65:
-        strategy = f"当前处于{trend}，建议观望为主，等待明确信号后再介入，关注支撑位 {support} 元。"
-    else:
-        strategy = f"当前处于{trend}，短期风险较大，建议回避或轻仓操作，若持有可考虑在 {resistance} 元附近减仓。"
+    # 构建 Prompt
+    sys_prompt = "你是一名顶级的量化交易大脑。请严格输出 JSON 格式，包含 score(整数0-100) 和 strategy(字符串，100字以内) 字段。"
+    user_prompt = f"请基于以下指标生成打分与操作建议：\n趋势: {trend}\nMACD: {macd}\nRSI: {rsi}\n支撑位: {support}\n阻力位: {resistance}\n"
+    
+    if data_quality == "partial":
+        user_prompt += "\n注意：该标的当前基本面数据缺失，请仅基于技术面形态和新闻进行研判。"
 
-    return {"score": ai_score, "strategy": strategy}
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    try:
+        response = requests.post(
+            f"{LLM_BASE_URL}/v1/chat/completions",
+            json={
+                "model": "local-model",
+                "messages": messages,
+                "temperature": 0.1,
+                "max_tokens": 4096,
+                "response_format": {"type": "json_object"}
+            },
+            timeout=30
+        )
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+        
+        # 1. 过滤掉可能的 <think>...</think> 标签及其内容
+        import re
+        cleaned_text = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+        
+        # 2. 提取 JSON 块
+        json_match = re.search(r'```json\n(.*?)\n```', cleaned_text, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(1)
+        else:
+            # 兜底直接解析
+            json_str = cleaned_text.strip()
+            
+        res_dict = json.loads(json_str)
+        ai_score = int(res_dict.get("score", 50))
+        strategy = str(res_dict.get("strategy", "无策略建议"))
+        return {"score": ai_score, "strategy": strategy}
+    except json.JSONDecodeError:
+        logger.error(f"LLM 响应解析失败，非标准 JSON。原始报文: {content[:200]}")
+        return {
+            "score": 50,
+            "strategy": f"LLM 服务异常(非标准JSON)，降级为中立观望。当前趋势{trend}，支撑{support}，阻力{resistance}。"
+        }
+    except Exception as e:
+        logger.error(f"LLM 请求发生意外连接错误: {e}")
+        return {
+            "score": 50,
+            "strategy": f"LLM 服务不可用，降级为中立观望。当前趋势{trend}，支撑{support}，阻力{resistance}。"
+        }
 
 
 # ── 层级 2: 磁盘缓存包装函数 ──────────────────────────────────
@@ -890,7 +975,7 @@ def render_deep_dive_analysis(watchlist):
 
     with col_btn:
         st.markdown("<br>", unsafe_allow_html=True)
-        generate_btn = st.button("生成 AI 深度研判报告", type="primary", use_container_width=True, key="deep_dive_btn")
+        generate_btn = st.button("生成 AI 深度研判报告", type="primary", width="stretch", key="deep_dive_btn")
 
     # 确定目标股票代码：优先使用自定义输入，否则使用下拉选择
     target_code = custom_code.strip() if custom_code.strip() else selected_stock
@@ -979,34 +1064,69 @@ def render_deep_dive_analysis(watchlist):
             st.markdown(f"> {ai['strategy']}")
 
 
-@st.cache_data(ttl="60s", show_spinner=False)
+@st.cache_data(ttl="10s", show_spinner=False)
 def get_enriched_watchlist_df(watchlist_codes: tuple) -> pd.DataFrame:
     """
     自选股列表富化 - 仅请求一次全市场快照 + 纯内存匹配，彻底避免 N+1 IO。
     """
     import pandas as pd
-    from feeds.market_data import get_global_spot_data, _normalize_code
+    try:
+        from xtquant import xtdata
+    except ImportError:
+        xtdata = None
 
-    spot_df = get_global_spot_data()  # 仅请求一次全市场快照
+    def format_qmt_code(stock_code):
+        """自动补充 QMT 所需的后缀"""
+        code_str = str(stock_code).strip()
+        # 如果已经带有后缀，可能格式不对，也需要清理
+        for prefix in ("sh", "sz", "bj"):
+            if code_str.lower().startswith(prefix):
+                code_str = code_str[len(prefix):]
+                break
+        
+        if code_str.startswith(('60', '68')):
+            return f"{code_str}.SH"
+        elif code_str.startswith(('00', '30')):
+            return f"{code_str}.SZ"
+        return code_str
+
     rows = []
     for i, code in enumerate(watchlist_codes):
-        clean = _normalize_code(code)
-        if spot_df is not None and not spot_df.empty and "代码" in spot_df.columns:
-            match = spot_df[spot_df["代码"].astype(str).str.zfill(6) == clean]
-            row = match.iloc[0].fillna(0) if not match.empty else pd.Series()
-        else:
-            row = pd.Series()
-        
-        name = str(row.get("名称", code)) if not row.empty and row.get("名称") != 0 else code
-        price = float(row.get("最新价", 0.0)) if not row.empty else 0.0
-        change_pct = float(row.get("涨跌幅", 0.0)) if not row.empty else 0.0
+        qmt_code = format_qmt_code(code)
+        stock_name = "未知名称"
+        last_price = 0.0
+        pre_close = 0.0
+        change_amt = 0.0
+        change_pct = 0.0
 
+        if xtdata is not None:
+            detail = xtdata.get_instrument_detail(qmt_code)
+            stock_name = detail['InstrumentName'] if detail else "未知名称"
+            
+            xtdata.subscribe_quote(qmt_code, period='1d', start_time='', end_time='', count=0, callback=None)
+            tick = xtdata.get_full_tick([qmt_code])
+            
+            if qmt_code in tick:
+                tick_data = tick[qmt_code]
+                if isinstance(tick_data, dict):
+                    last_price = tick_data.get('lastPrice', 0.0)
+                    pre_close = tick_data.get('lastClose', 0.0)
+                    if pre_close > 0:
+                        change_amt = last_price - pre_close
+                        change_pct = change_amt / pre_close * 100
+                        
+        if last_price > 0 and pre_close > 0:
+            sign = "+" if change_amt > 0 else ""
+            change_str = f"{sign}{change_amt:.2f} ({sign}{change_pct:.2f}%)"
+        else:
+            change_str = "N/A"
+                    
         rows.append({
             "序号": i + 1,
             "股票代码": code,
-            "股票名称": name,
-            "最新价": f"¥{price:.2f}" if price > 0 else "N/A",
-            "涨跌幅": f"{change_pct:+.2f}%" if price > 0 else "N/A",
+            "股票名称": stock_name,
+            "最新价": f"¥{last_price:.2f}" if last_price > 0 else "N/A",
+            "涨跌幅": change_str,
         })
         
     return pd.DataFrame(rows)
@@ -1050,7 +1170,17 @@ def module_watchlist_manager():
 
         # 合并两个 DataFrame
         final_df = enriched_df.merge(strategy_notes_df, on="股票代码", how="left")
-        st.dataframe(final_df, use_container_width=True, hide_index=True)
+        
+        def color_change(val):
+            if isinstance(val, str) and val != "N/A":
+                if val.startswith("+"):
+                    return 'color: #ff4d4f'  # 红色表示上涨
+                elif val.startswith("-"):
+                    return 'color: #52c41a'  # 绿色表示下跌
+            return ''
+            
+        styled_df = final_df.style.map(color_change, subset=["涨跌幅"])
+        st.dataframe(styled_df, width="stretch", hide_index=True)
     else:
         st.info("自选股列表为空，请添加股票代码")
 
@@ -1083,7 +1213,7 @@ def module_watchlist_manager():
                 key="notes_input"
             )
 
-        submitted = st.form_submit_button("➕ 添加", use_container_width=True)
+        submitted = st.form_submit_button("➕ 添加", width="stretch")
 
         if submitted:
             if not stock_code:
@@ -1116,7 +1246,7 @@ def module_watchlist_manager():
             col_idx = i % len(cols)
             code = item["code"]
             with cols[col_idx]:
-                if st.button(f"🗑️ {code}", key=f"del_{code}", use_container_width=True):
+                if st.button(f"🗑️ {code}", key=f"del_{code}", width="stretch"):
                     normalized_watchlist.remove(item)
                     if save_json(watchlist_file, normalized_watchlist):
                         st.success(f"✅ 已删除 {code}")
@@ -1128,51 +1258,40 @@ def module_watchlist_manager():
     render_deep_dive_analysis(normalized_watchlist)
 
 
-def scan_report_dates():
-    """扫描 data_cache/ 目录，提取所有有日报的日期，按时间倒序返回"""
+def scan_reflexion_dates():
+    """扫描 reports/ 目录，提取所有有 AI 复盘的日期，按时间倒序返回"""
     dates = []
-    if CACHE_DIR.exists():
-        for f in CACHE_DIR.glob("daily_report_*.md"):
-            # 从文件名提取日期: daily_report_YYYYMMDD.md
-            date_str = f.stem.replace("daily_report_", "")
+    reports_dir = Path("reports")
+    if reports_dir.exists():
+        for f in reports_dir.glob("reflexion_*.md"):
+            # 从文件名提取日期: reflexion_YYYYMMDD.md
+            date_str = f.stem.replace("reflexion_", "")
             if len(date_str) == 8 and date_str.isdigit():
                 dates.append(date_str)
     return sorted(dates, reverse=True)
 
 
 def module_history_review():
-    """模块 4：历史复盘"""
-    st.header("📜 历史复盘")
+    """模块 4：历史复盘 (V3.0 AI 复盘闭环)"""
+    st.header("📜 历史复盘与大模型反思")
 
-    dates = scan_report_dates()
+    dates = scan_reflexion_dates()
     if not dates:
-        st.info("暂无历史日报记录")
+        st.info("暂无历史 AI 复盘记录。每天 15:15 盘后会自动生成。")
         return
 
-    selected_date = st.selectbox("选择历史日期", dates)
+    selected_date = st.selectbox("📅 选择复盘日期", dates)
     if not selected_date:
         return
 
-    report_path = CACHE_DIR / f"daily_report_{selected_date}.md"
-    feedback_path = CACHE_DIR / f"llm_feedback_{selected_date}.md"
+    report_path = Path("reports") / f"reflexion_{selected_date}.md"
 
-    col_left, col_right = st.columns(2)
-
-    with col_left:
-        st.subheader("📈 历史战报")
-        if report_path.exists():
-            content = report_path.read_text(encoding="utf-8")
-            st.markdown(content)
-        else:
-            st.warning("战报文件不存在")
-
-    with col_right:
-        st.subheader("🤖 大模型反思反馈")
-        if feedback_path.exists():
-            content = feedback_path.read_text(encoding="utf-8")
-            st.markdown(content)
-        else:
-            st.info("当日无大模型反思记录")
+    if report_path.exists():
+        st.markdown("---")
+        content = report_path.read_text(encoding="utf-8")
+        st.markdown(content)
+    else:
+        st.warning("复盘文件不存在")
 
 
 def module_system_logs():

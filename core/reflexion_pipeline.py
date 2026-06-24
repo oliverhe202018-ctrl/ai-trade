@@ -118,18 +118,92 @@ def call_evaluator(trading_experience: str) -> dict:
     return json.loads(raw)
 
 
-# ==================== 主流程 ====================
+def generate_daily_markdown_report():
+    logger.info("[REFLEXION] 开始生成每日 Markdown 复盘报告...")
+    from datetime import datetime
+    
+    # 读取 live_portfolio.json
+    portfolio_file = "data_cache/live_portfolio.json"
+    portfolio_data = {}
+    if os.path.exists(portfolio_file):
+        with open(portfolio_file, "r", encoding="utf-8") as f:
+            portfolio_data = json.load(f)
+            
+    # 读取 backtest_stats.json
+    stats_file = "data_cache/backtest_stats.json"
+    stats_data = {}
+    if os.path.exists(stats_file):
+        with open(stats_file, "r", encoding="utf-8") as f:
+            stats_data = json.load(f)
+            
+    # 构建 prompt
+    portfolio_str = json.dumps(portfolio_data, ensure_ascii=False)
+    stats_str = json.dumps(stats_data, ensure_ascii=False)
+    
+    prompt = (
+        f"你是一位资深的量化交易系统架构师与策略复盘专家。\n"
+        f"以下是今日的实盘资金与持仓数据：\n{portfolio_str}\n\n"
+        f"以下是系统当前的各策略回测胜率基础：\n{stats_str}\n\n"
+        "请为今日的交易表现生成一份详细的复盘报告，必须以 Markdown 格式输出，"
+        "包含以下部分：\n"
+        "1. 资金与持仓概览\n"
+        "2. 策略得失分析（结合历史回测胜率对比）\n"
+        "3. 下一步调参建议\n"
+        "请直接输出 Markdown 文本，不要有额外的解释。"
+    )
+    
+    try:
+        response = generator_client.chat.completions.create(
+            model="local-model",
+            messages=[
+                {"role": "system", "content": "你是一个专业量化复盘报告生成器。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=2048,
+            timeout=120
+        )
+        report_content = response.choices[0].message.content.strip()
+        
+        # 移除可能存在的 Markdown JSON 标记
+        if report_content.startswith("```markdown"):
+            report_content = report_content.replace("```markdown", "", 1)
+        if report_content.endswith("```"):
+            report_content = report_content[:-3]
+            
+        report_content = report_content.strip()
+        
+        # 落盘
+        reports_dir = "reports"
+        if not os.path.exists(reports_dir):
+            os.makedirs(reports_dir)
+            
+        date_str = datetime.now().strftime("%Y%m%d")
+        report_file = os.path.join(reports_dir, f"reflexion_{date_str}.md")
+        
+        with open(report_file, "w", encoding="utf-8") as f:
+            f.write(report_content)
+            
+        logger.info(f"[REFLEXION] 报告已保存至 {report_file}")
+        return report_file
+    except Exception as e:
+        logger.exception(f"[REFLEXION] 生成报告失败: {e}")
+        return None
 
 def run_daily_reflexion():
     """
     每日反思主流程：
-    1. 模拟拉取当日异动股与重大新闻
-    2. 调用 Generator 生成交易经验
-    3. 调用 Evaluator 评分
-    4. score >= 8 时存入 ChromaDB
+    1. 生成 Markdown 盘后复盘报告
+    2. 模拟拉取当日异动股与重大新闻
+    3. 调用 Generator 生成交易经验
+    4. 调用 Evaluator 评分
+    5. score >= 8 时存入 ChromaDB
     """
     logger.info("=" * 60)
     logger.info("[REFLEXION] 开始每日反思流程...")
+    
+    # --- 新增：盘后复盘报告 ---
+    generate_daily_markdown_report()
 
     # --- 步骤1：模拟拉取当日数据 ---
     news_text = (
@@ -201,19 +275,5 @@ def run_daily_reflexion():
         "doc_id": doc_id if score >= 8 else None,
     }
 
-
-# ==================== 定时调度 ====================
-
 if __name__ == "__main__":
     run_daily_reflexion()
-
-#if __name__ == "__main__":
-    #schedule.every().day.at("20:00").do(run_daily_reflexion)
-  #  logger.info("[SCHEDULER] 反思管线已启动，每日 20:00 自动执行")
-
-    # 首次启动时立即执行一次（可选）
-    # run_daily_reflexion()
-
-    #while True:
-      #  schedule.run_pending()
-        #time.sleep(30)

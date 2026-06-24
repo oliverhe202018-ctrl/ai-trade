@@ -76,6 +76,9 @@ def run_daemon():
     schedule.every().day.at("15:10").do(
         lambda: safe_execute("阶段三：日终结算", _phase_daily_settlement)
     )
+    schedule.every().day.at("15:15").do(
+        lambda: safe_execute("阶段四：盘后复盘", _phase_reflexion)
+    )
 
     # 主循环：持续检查并执行到期任务
     while True:
@@ -126,6 +129,14 @@ def _phase_daily_settlement():
     except Exception as e:
         logger.exception(f"[日终结算] 落盘失败: {e}")
 
+def _phase_reflexion():
+    """阶段四：盘后复盘 - 调用大模型进行深度复盘并生成 Markdown 报告"""
+    try:
+        from core.reflexion_pipeline import run_daily_reflexion
+        logger.info("[盘后复盘] 开始生成 AI 复盘报告...")
+        run_daily_reflexion()
+    except Exception as e:
+        logger.exception(f"[盘后复盘] 失败: {e}")
 
 if __name__ == "__main__":
     run_daemon()

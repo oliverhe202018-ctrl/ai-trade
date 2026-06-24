@@ -33,6 +33,7 @@ LIVE_UNIVERSE = BACKTEST_UNIVERSE
 # 跨日时（检测到日期变化）自动清空集合
 _dca_traded_today = set()
 _last_dca_date = datetime.now().date()
+_last_index_change_pct = 0.0  # 增加：大盘风控缓存
 
 class LRUStockHistory(OrderedDict):
     def __init__(self, maxsize=50, *args, **kwargs):
@@ -130,7 +131,36 @@ def run_slow_brain():
         # 1. 加载最新资产账本
         portfolio = load_portfolio()
         if not portfolio:
-            portfolio = {"cash": 100000, "positions": {}}
+            portfolio = {"cash": 100000.0, "positions": {}}
+        
+        # 容错：确保关键字段存在
+        if "cash" not in portfolio:
+            portfolio["cash"] = 100000.0
+        if "positions" not in portfolio:
+            portfolio["positions"] = {}
+
+        # ==========================================
+        # 🚨 大盘系统性风险熔断检测
+        # ==========================================
+        systemic_risk_halt = False
+        global _last_index_change_pct
+        try:
+            import requests
+            resp = requests.get("http://hq.sinajs.cn/list=s_sh000001", timeout=8)
+            if resp.status_code == 200:
+                data_part = resp.text.split('"')[1]
+                fields = data_part.split(',')
+                if len(fields) >= 4:
+                    index_change_pct = float(fields[3])
+                    _last_index_change_pct = index_change_pct
+                    if index_change_pct <= -2.5:
+                        systemic_risk_halt = True
+                        logger.error(f"🚨 [风控拦截] 上证指数跌幅 {index_change_pct}% >= 2.5%，触发全局系统性风险规避，本轮禁止买入！")
+        except Exception as e:
+            logger.warning(f"[风控检测] 获取大盘指数失败，使用最后缓存值 {_last_index_change_pct}%: {e}")
+            if _last_index_change_pct <= -2.5:
+                systemic_risk_halt = True
+                logger.error(f"🚨 [风控拦截] (基于缓存) 上证指数跌幅 {_last_index_change_pct}% >= 2.5%，触发全局系统性风险规避，本轮禁止买入！")
 
         # 2. 获取实时行情 - ThreadPoolExecutor 并发拉取
         daily_quotes = []
@@ -196,7 +226,14 @@ def run_slow_brain():
             regime = determine_market_regime(hist)
             regime_buckets[regime].append(q)
 
-        total_capital = portfolio["cash"] + sum(pos["shares"] * price_map.get(c, pos["avg_price"]) for c, pos in portfolio["positions"].items())
+        # 🚨 全局系统性风险规避：清空所有买入篮子
+        if systemic_risk_halt:
+            regime_buckets["grid"].clear()
+            regime_buckets["smart_dca"].clear()
+            regime_buckets["trend"].clear()
+            logger.warning("🚨 [风控拦截] 已清空所有策略的买入队列。")
+
+        total_capital = portfolio.get("cash", 0.0) + sum(pos.get("shares", 0) * price_map.get(c, pos.get("avg_price", 0.0)) for c, pos in portfolio.get("positions", {}).items())
 
         # ==========================================
         # C2: 网格策略广播

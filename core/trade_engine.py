@@ -19,10 +19,11 @@ from datetime import datetime
 from filelock import FileLock, Timeout
 
 try:
-    from xtquant import xttrader, xttype
+    from xtquant import xttrader, xttype, xtdata
     XTQUANT_AVAILABLE = True
 except ImportError:
     XTQUANT_AVAILABLE = False
+
 
 # ============ 结构化日志 ============
 
@@ -459,6 +460,18 @@ class QMTBroker(BaseBroker):
         """QMT 实盘买入。"""
         qmt_code = self._to_qmt_code(code)
         try:
+            # 同标的重复委托拦截
+            active_orders = self.trader.query_stock_orders(self.account)
+            for order in active_orders:
+                if order.stock_code == qmt_code and order.order_status in [xttype.XT_ORDER_UNREPORTED, xttype.XT_ORDER_REPORTED]:
+                     raise PermissionError(f"DUPLICATE_ORDER_BLOCK: {qmt_code}")
+
+            # 涨跌停拒单拦截
+            tick = xtdata.get_full_tick([qmt_code])
+            if tick and qmt_code in tick:
+                if tick[qmt_code]['lastPrice'] >= tick[qmt_code]['limit_up']:
+                    return {"success": False, "message": f"REJECT_BUY_LIMIT_UP: {qmt_code}"}
+
             order_id = self.trader.order_stock_async(
                 self.account, qmt_code, xttype.STOCK_BUY, shares, 0, price, ""
             )
@@ -468,10 +481,23 @@ class QMTBroker(BaseBroker):
             logger.exception(f"QMT 买入失败: {e}")
             return {"success": False, "message": f"QMT 买入失败: {e}"}
 
+
     def sell(self, code: str, shares: int, price: float, **kwargs) -> dict:
         """QMT 实盘卖出。"""
         qmt_code = self._to_qmt_code(code)
         try:
+            # 同标的重复委托拦截
+            active_orders = self.trader.query_stock_orders(self.account)
+            for order in active_orders:
+                if order.stock_code == qmt_code and order.order_status in [xttype.XT_ORDER_UNREPORTED, xttype.XT_ORDER_REPORTED]:
+                     raise PermissionError(f"DUPLICATE_ORDER_BLOCK: {qmt_code}")
+
+            # 涨跌停拒单拦截
+            tick = xtdata.get_full_tick([qmt_code])
+            if tick and qmt_code in tick:
+                if tick[qmt_code]['lastPrice'] <= tick[qmt_code]['limit_down']:
+                    return {"success": False, "message": f"REJECT_SELL_LIMIT_DOWN: {qmt_code}"}
+
             order_id = self.trader.order_stock_async(
                 self.account, qmt_code, xttype.STOCK_SELL, shares, 0, price, ""
             )
@@ -480,6 +506,7 @@ class QMTBroker(BaseBroker):
         except Exception as e:
             logger.exception(f"QMT 卖出失败: {e}")
             return {"success": False, "message": f"QMT 卖出失败: {e}"}
+
 
 
 # ============ 全局默认 broker 实例 ============

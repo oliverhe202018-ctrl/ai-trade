@@ -85,6 +85,30 @@ def _get_ai_scoring_batch_inner(candidates, config=None):
         logger.error(f"  [ERROR] 获取宏观情绪失败: {e}，使用空降级")
         macro_context = "当前宏观数据缺失，请纯按技术面和资金面打分。"
 
+    # ================= 新增：回测胜率数据注入 =================
+    try:
+        from core.strategy_engine import _get_market_filter
+        mf = _get_market_filter()
+        regime_key = "RISK_ON"
+        if mf and mf is not False:
+            regime = mf.assess_market_regime()
+            regime_key = regime["regime"]
+            
+        stats_file = "./data_cache/backtest_stats.json"
+        if os.path.exists(stats_file):
+            with open(stats_file, "r", encoding="utf-8") as f:
+                stats_data = json.load(f)
+                regime_stats = stats_data.get("regimes", {}).get(regime_key, {})
+                stats_str = json.dumps(regime_stats, ensure_ascii=False)
+        else:
+            stats_str = "无回测数据"
+            
+        macro_context += f"\n\n【历史回测概率参考】：当前大盘状态为 {regime_key}。该状态下系统策略历史胜率：{stats_str}。请严格结合历史胜率进行打分。"
+        logger.info(f"  [DEBUG] 成功注入大盘状态 ({regime_key}) 的历史胜率数据。")
+    except Exception as e:
+        logger.error(f"  [ERROR] 注入回测胜率失败: {e}")
+    # ========================================================
+
     # 2. 触发 RAG 记忆检索：用当前复杂的宏观情绪去知识库里找“相似的历史教训”
     retrieved_memories = get_relevant_experience(macro_context)
 
@@ -163,9 +187,22 @@ def _get_ai_scoring_batch_inner(candidates, config=None):
 
     logger.info(f"[DEBUG] LLM 返回内容长度: {len(content)}")
 
-    # 直接解析 JSON（强制 json_object 模式下无需正则提取）
-    business_data = json.loads(content)
-
+    # 1. 过滤掉可能的 <think>...</think> 标签及其内容
+    import re
+    cleaned_text = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL)
+    
+    # 2. 提取 JSON 块
+    json_match = re.search(r'```json\n(.*?)\n```', cleaned_text, re.DOTALL)
+    if json_match:
+        json_str = json_match.group(1)
+    else:
+        # 兜底直接解析
+        json_str = cleaned_text.strip()
+        
+    try:
+        business_data = json.loads(json_str)
+    except json.JSONDecodeError:
+        raise ValueError(f"严格 JSON 解析失败，清理后报文: {json_str[:200]}")
     all_ai_score_map = {
         item.get("code"): item for item in business_data.get("stock_picks", [])
     }

@@ -206,40 +206,63 @@ if __name__ == "__main__":
 
 def fetch_stock_news(stock_code: str, limit: int = 5) -> list:
     """
-    使用 akshare 获取个股最新新闻。
-    接口：ak.stock_news_em(symbol=code)
-
-    返回新闻列表，每条包含 title、publish_time、sentiment。
-    失败时返回空列表。
+    使用 AkShare 东方财富源获取个股最新新闻。
     """
     try:
         import akshare as ak
-
-        # akshare 的 stock_news_em 需要纯数字代码
         raw_code = stock_code.strip().lower()
-        if raw_code.startswith(("sh", "sz")):
+        if raw_code.startswith(("sh", "sz", "bj")):
             raw_code = raw_code[2:]
-
-        df = ak.stock_news_em(symbol=raw_code)
-        if df is None or df.empty:
-            logger.warning(f"[news_extractor] stock_news_em 返回空数据 for {raw_code}")
+            
+        news_df = ak.stock_news_em(symbol=raw_code)
+        if news_df.empty:
             return []
-
+            
+        records = news_df[['新闻标题', '新闻内容', '发布时间']].head(limit).to_dict('records')
         news_items = []
-        for _, row in df.head(limit).iterrows():
-            title = str(row.get("新闻标题", ""))
-            pub_time = str(row.get("发布时间", ""))
-            if not title:
-                continue
+        for r in records:
             news_items.append({
-                "title": title,
-                "publish_time": pub_time,
-                "sentiment": "中性",  # 暂未接入 LLM 情感分析，默认中性
+                "title": r["新闻标题"],
+                "publish_time": r["发布时间"],
+                "sentiment": "中性"  # 默认中性，可接 LLM 情感分析
             })
-
-        logger.info(f"[news_extractor] 获取到 {len(news_items)} 条 {raw_code} 新闻")
         return news_items
-
     except Exception as e:
-        logger.exception(f"[news_extractor] fetch_stock_news({stock_code}) 失败: {e}")
+        from core.logger_config import logger
+        logger.error(f"资讯获取失败 {stock_code}: {e}")
         return []
+
+import streamlit as st
+
+    """
+    rss_urls = [
+        "https://rss.sina.com.cn/roll/finance/hot_roll.xml"
+    ]
+    all_entries = []
+    for url in rss_urls:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries:
+                title = entry.get("title", "")
+                summary = entry.get("summary", "")
+                pub_date = entry.get("published", "")
+                
+                try:
+                    from dateutil import parser
+                    dt = parser.parse(pub_date)
+                    pub_time = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except:
+                    from datetime import datetime
+                    pub_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
+                all_entries.append({
+                    "title": title,
+                    "summary": summary,
+                    "publish_time": pub_time
+                })
+        except Exception:
+            pass
+            
+    # 按时间降序排列
+    all_entries.sort(key=lambda x: x["publish_time"], reverse=True)
+    return all_entries
