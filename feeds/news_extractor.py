@@ -232,37 +232,3 @@ def fetch_stock_news(stock_code: str, limit: int = 5) -> list:
         logger.error(f"资讯获取失败 {stock_code}: {e}")
         return []
 
-import streamlit as st
-
-    """
-    rss_urls = [
-        "https://rss.sina.com.cn/roll/finance/hot_roll.xml"
-    ]
-    all_entries = []
-    for url in rss_urls:
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries:
-                title = entry.get("title", "")
-                summary = entry.get("summary", "")
-                pub_date = entry.get("published", "")
-                
-                try:
-                    from dateutil import parser
-                    dt = parser.parse(pub_date)
-                    pub_time = dt.strftime("%Y-%m-%d %H:%M:%S")
-                except:
-                    from datetime import datetime
-                    pub_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                
-                all_entries.append({
-                    "title": title,
-                    "summary": summary,
-                    "publish_time": pub_time
-                })
-        except Exception:
-            pass
-            
-    # 按时间降序排列
-    all_entries.sort(key=lambda x: x["publish_time"], reverse=True)
-    return all_entries

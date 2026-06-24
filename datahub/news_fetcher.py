@@ -51,10 +51,13 @@ class AkshareProvider(NewsProvider):
             results = []
             for _, row in df.iterrows():
                 results.append({
+                    'symbol': symbol,
                     'title': row.get('新闻标题', ''),
                     'content': row.get('新闻内容', ''),
                     'publish_time': row.get('发布时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
-                    'raw_data': row.to_json()
+                    'provider': self.name,
+                    'source_url': row.get('文章链接', ''),
+                    'raw_data': row.to_json(force_ascii=False)
                 })
             return results
         except Exception as e:
@@ -119,13 +122,54 @@ class EastMoneyProvider(NewsProvider):
             content = content.replace('\u3000', '').replace('\r\n', ' ')
             
             results.append({
+                'symbol': symbol,
                 'title': title,
                 'content': content,
                 'publish_time': row.get("date", datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
-                'provider': 'eastmoney',
+                'provider': self.name,
+                'source_url': row.get("url", ""),
                 'raw_data': json.dumps(row, ensure_ascii=False)
             })
         
+        return results
+
+class LocalCacheProvider(NewsProvider):
+    def __init__(self):
+        super().__init__('local_cache')
+
+    def fetch(self, symbol):
+        from datahub.storage import get_db_conn
+        from datetime import datetime, timedelta
+        
+        logger.info(f"[NEWS_FETCH_DEGRADED] Fallback to LocalCacheProvider for {symbol}. Reading local cache.")
+        results = []
+        try:
+            with get_db_conn() as conn:
+                cursor = conn.cursor()
+                # 仅读取 24 小时内的新鲜数据
+                cutoff_time = (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
+                
+                cursor.execute('''
+                    SELECT title, content, publish_time, raw_data 
+                    FROM raw_news 
+                    WHERE symbol = ? AND publish_time >= ?
+                    ORDER BY publish_time DESC LIMIT 10
+                ''', (symbol, cutoff_time))
+                
+                rows = cursor.fetchall()
+                for row in rows:
+                    results.append({
+                        'symbol': symbol,
+                        'title': row[0],
+                        'content': row[1],
+                        'publish_time': row[2],
+                        'provider': self.name,
+                        'source_url': '',
+                        'raw_data': row[3]
+                    })
+        except Exception as e:
+            logger.error(f"Error reading from LocalCacheProvider for {symbol}: {e}")
+            
         return results
 
 def save_news(symbol, provider_name, news_items):
@@ -174,14 +218,20 @@ def fetch_worker(provider, symbol, timeout=15):
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(provider.fetch, symbol)
             try:
-                return future.result(timeout=timeout)
+                result = future.result(timeout=timeout)
+                if result:
+                    return "SUCCESS_WITH_DATA", result
+                else:
+                    return "SUCCESS_NO_DATA", []
             except Exception as e:
                 backoff_time = min(60 * (2 ** attempt), 600)
                 logger.warning(f"[BACKOFF] Attempt {attempt+1}/{max_retries} failed for {provider.name} on {symbol}: {e}. Retrying in {backoff_time}s.")
                 if attempt < max_retries - 1:
                     time.sleep(backoff_time)
                 else:
-                    raise
+                    logger.error(f"[PROVIDER_FAIL] All attempts failed for {provider.name} on {symbol}.")
+                    return "FAILED", []
+    return "FAILED", []
 
 def get_held_stocks():
     fallback_env = os.getenv("NEWS_FALLBACK_WATCHLIST", "")
@@ -206,8 +256,7 @@ def get_held_stocks():
 def scheduler_loop():
     init_db()
     import random
-    primary_provider = AkshareProvider()
-    fallback_provider = EastMoneyProvider()
+    providers = [AkshareProvider(), EastMoneyProvider(), LocalCacheProvider()]
     circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout_minutes=5)
     
     logger.info("Starting scheduler loop...")
@@ -216,43 +265,31 @@ def scheduler_loop():
         try:
             symbols = get_held_stocks()
             for symbol in symbols:
-                current_provider = primary_provider
+                fetch_success = False
                 
-                if not circuit_breaker.allow(current_provider.name):
-                    logger.warning(f"[PROVIDER_FAILOVER] Circuit breaker open for {current_provider.name}, falling back to {fallback_provider.name}.")
-                    current_provider = fallback_provider
-                    if not circuit_breaker.allow(current_provider.name):
-                        logger.warning(f"Circuit breaker open for fallback {current_provider.name} too, skipping.")
+                for provider in providers:
+                    if not circuit_breaker.allow(provider.name):
+                        logger.warning(f"[PROVIDER_FAILOVER] Circuit breaker open for {provider.name}, skipping.")
                         continue
                         
-                try:
-                    news_items = fetch_worker(current_provider, symbol, timeout=20)
-                    if news_items:
-                        circuit_breaker.success(current_provider.name)
-                        save_news(symbol, current_provider.name, news_items)
-                        logger.info(f"Saved {len(news_items)} news items for {symbol} from {current_provider.name}.")
-                    else:
-                        logger.info(f"[PROVIDER_NO_DATA] {current_provider.name} returned empty news for {symbol}.")
-                except Exception as e:
-                    circuit_breaker.failure(current_provider.name)
-                    logger.error(f"[PROVIDER_FAIL] Fetch failed for {current_provider.name} on {symbol}: {e}")
+                    status, data = fetch_worker(provider, symbol, timeout=20)
                     
-                    if current_provider == primary_provider:
-                        logger.info(f"[PROVIDER_FAILOVER] Immediate fallback to {fallback_provider.name} after primary failure.")
-                        try:
-                            if circuit_breaker.allow(fallback_provider.name):
-                                news_items = fetch_worker(fallback_provider, symbol, timeout=20)
-                                if news_items:
-                                    circuit_breaker.success(fallback_provider.name)
-                                    save_news(symbol, fallback_provider.name, news_items)
-                                    logger.info(f"Saved {len(news_items)} news items for {symbol} from {fallback_provider.name}.")
-                                else:
-                                    logger.info(f"[PROVIDER_NO_DATA] Fallback {fallback_provider.name} returned empty news for {symbol}.")
-                            else:
-                                logger.warning(f"[PROVIDER_FAILOVER] Circuit breaker open for fallback {fallback_provider.name}, skipping.")
-                        except Exception as fb_e:
-                            circuit_breaker.failure(fallback_provider.name)
-                            logger.error(f"[PROVIDER_FAIL] Fallback fetch failed for {fallback_provider.name} on {symbol}: {fb_e}")
+                    if status == "SUCCESS_WITH_DATA":
+                        circuit_breaker.success(provider.name)
+                        save_news(symbol, provider.name, data)
+                        logger.info(f"Saved {len(data)} news items for {symbol} from {provider.name}.")
+                        fetch_success = True
+                        break
+                    elif status == "SUCCESS_NO_DATA":
+                        logger.info(f"[PROVIDER_NO_DATA] {provider.name} returned empty news for {symbol}.")
+                        fetch_success = True
+                        break
+                    elif status == "FAILED":
+                        circuit_breaker.failure(provider.name)
+                        logger.error(f"[PROVIDER_FAIL] Fetch failed for {provider.name} on {symbol}")
+                        
+                if not fetch_success:
+                    logger.warning(f"[NEWS_FETCH_DEGRADED] All providers failed for {symbol}.")
             
         except Exception as e:
             logger.error(f"Scheduler loop error: {e}")
