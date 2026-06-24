@@ -1361,6 +1361,16 @@ def module_paper_trading_monitor():
     st.header("📈 Paper Trading 监控与审计大屏")
     st.markdown("监控最近 5 个交易日的实盘试运行情况，验证全链路风控与信号流转是否符合预期。")
     
+    st.info("""
+    **🎯 首日 Paper Trading 通过标准：**
+    1. 全部关键进程可稳定运行到收盘，不出现主循环崩溃。
+    2. Dashboard 的 Paper Trading 监控可正常统计关键审计字段。
+    3. 没有 FOLLOW_RULE_ONLY 和 Unknown final action 命中。
+    4. LLM、指数缓存、交易状态任一异常时，系统都表现为保守阻断，而不是继续开新仓。
+    5. 任意一笔交易都能在日志中追溯到完整审计链路。
+    """)
+    st.markdown("---")
+    
     keywords = [
         "[TRADE_TRACE]",
         "[RISK_GATE_BLOCK]",
