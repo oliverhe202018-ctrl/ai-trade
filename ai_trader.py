@@ -149,16 +149,16 @@ def decide(symbol, market_data):
     events_json, event_ids = get_local_events(symbol, lookback_minutes=180)
     
     if not events_json:
-        rule_signal['status'] = "FOLLOW_RULE_ONLY"
-        logger.info(f"[{symbol}] No recent events. FOLLOW_RULE_ONLY. Initial action: {rule_signal['action']}")
-        return rule_signal['action'], [], None, decision_id
+        original_action = rule_signal['action'].lower()
+        if original_action in ["sell", "reduce", "veto"]:
+            logger.info(f"[{symbol}] No fresh events. Allowing defensive action: {original_action}")
+            return original_action, [], None, decision_id
+        else:
+            logger.info(f"[{symbol}] [NO_FRESH_EVENTS_HOLD] No fresh events. Holding instead of {original_action}.")
+            return "hold", [], None, decision_id
         
     logger.info(f"[{symbol}] Found recent events. Forwarding to LLM for veto check...")
     llm_action, confidence = call_llm_veto(rule_signal, events_json)
-    
-    if llm_action == "FOLLOW_RULE_ONLY":
-        logger.info(f"[{symbol}] Network disconnected. FOLLOW_RULE_ONLY. Initial action: {rule_signal['action']}")
-        return rule_signal['action'], [], events_json, decision_id
         
     # [TRADE_TRACE] for LLM Veto
     llm_audit = {
@@ -192,8 +192,8 @@ def final_risk_gate(symbol, action, market_data, events=None, portfolio=None, de
             logger.info(f"[TRADE_TRACE] {json.dumps({'decision_id': decision_id, 'risk_gate_result': 'PASSED', 'block_reason': ''})}")
         return passed_action
     
-    if action == 'veto':
-        return "veto"
+    if action in ['veto', 'hold']:
+        return action
         
     if action == 'reduce':
         logger.info(f"[RISK_GATE] [{symbol}] Action is reduce, allowing risk reduction.")
@@ -278,11 +278,14 @@ def main_loop():
     pub_socket = context.socket(zmq.PUB)
     # HWM (High Water Mark) to drop messages if live_trader is dead
     pub_socket.setsockopt(zmq.SNDHWM, 1000)
-    pub_socket.bind("tcp://127.0.0.1:5555")
+    
+    AI_TRADER_PUB_ENDPOINT = "tcp://127.0.0.1:5557"
+    pub_socket.bind(AI_TRADER_PUB_ENDPOINT)
+    logger.info(f"[ZMQ_BIND] source=ai_trader endpoint={AI_TRADER_PUB_ENDPOINT}")
     
     symbols = ["600519", "000858"]
     
-    logger.info("Starting AI Trader main loop... ZeroMQ PUB bounded at 5555.")
+    logger.info(f"Starting AI Trader main loop... ZeroMQ PUB bounded at {AI_TRADER_PUB_ENDPOINT}.")
     while True:
         portfolio = load_portfolio() or {"cash": 100000.0, "positions": {}}
         for symbol in symbols:
@@ -301,7 +304,7 @@ def main_loop():
                 elif final_action == 'reduce':
                     mapped_action = "REDUCE"
                     logger.info(f"[{symbol}] Executing trade: REDUCE position")
-                elif final_action in ['veto', 'hold', 'FOLLOW_RULE_ONLY']:
+                elif final_action in ['veto', 'hold']:
                     logger.info(f"[{symbol}] Trade execution {final_action.upper()}, VETOED/HOLD, not publishing.")
                     continue
                 else:
@@ -317,6 +320,7 @@ def main_loop():
                 # ZMQ Publishing
                 trade_payload = {
                     "order_id": trade_id,
+                    "trade_id": trade_id,
                     "decision_id": decision_id,
                     "source": "ai_trader",
                     "code": symbol,

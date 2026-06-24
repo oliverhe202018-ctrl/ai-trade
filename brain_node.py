@@ -35,22 +35,29 @@ _dca_traded_today = set()
 _last_dca_date = datetime.now().date()
 _last_index_change_pct = None  # 增加：大盘风控缓存
 
+_stale_cache_counter = 0
+
 def _get_index_change_pct_from_cache():
     """从本地缓存文件读取大盘跌幅"""
+    global _stale_cache_counter
     cache_file = os.path.join(PROJECT_ROOT, "data_cache", "index_sh000001.json")
     try:
         if os.path.exists(cache_file):
             with open(cache_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             
-            if time.time() - data.get("ts", 0) > 300:
-                logger.warning("[INDEX_CACHE_STALE] 大盘缓存文件超过5分钟未更新，准备 fallback 到内存缓存")
+            # 超过 10 分钟未更新视为 stale
+            if time.time() - data.get("ts", 0) > 600:
+                _stale_cache_counter += 1
+                logger.warning(f"[INDEX_CACHE_STALE] 大盘缓存文件超过 10 分钟未更新！连续陈旧次数: {_stale_cache_counter}，准备 fallback 到内存缓存")
                 return None
+                
+            _stale_cache_counter = 0
             return float(data.get("change_pct", 0.0))
         else:
-            logger.warning("[INDEX_CACHE_MISSING] 大盘缓存文件不存在，准备 fallback 到内存缓存")
+            logger.warning("[INDEX_CACHE_MISSING] 大盘缓存文件不存在，可能 index_cache_updater 未启动！")
     except Exception as e:
-        logger.warning(f"[风控预警] 读取大盘缓存失败: {e}")
+        logger.error(f"[INDEX_CACHE_ERROR] 读取大盘缓存失败: {e}")
     return None
 
 class LRUStockHistory(OrderedDict):
@@ -87,7 +94,9 @@ def run_slow_brain():
     # 启动 ZeroMQ 广播基站
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
-    socket.bind("tcp://127.0.0.1:5555")
+    BRAIN_NODE_PUB_ENDPOINT = "tcp://127.0.0.1:5555"
+    socket.bind(BRAIN_NODE_PUB_ENDPOINT)
+    logger.info(f"[ZMQ_BIND] source=brain_node endpoint={BRAIN_NODE_PUB_ENDPOINT}")
 
     _stock_history = LRUStockHistory(maxsize=50)
     _config = {
@@ -106,15 +115,22 @@ def run_slow_brain():
     )
 
     def send_order(action: str, code: str, shares: int, price: float, reason: str):
+        import uuid
         # 5分钟指纹幂等性ID
         order_id = f"{code}_{action}_{int(time.time())//300}"
+        trade_id = str(uuid.uuid4())
         order = {
             "order_id": order_id,
+            "trade_id": trade_id,
+            "decision_id": "",
+            "event_ids": [],
+            "source": "brain_node",
             "action": action,
             "code": code,
             "shares": int(shares),
             "signal_price": float(price),
-            "reason": str(reason)
+            "reason": str(reason),
+            "timestamp": datetime.now().isoformat()
         }
         socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
         logger.info(f"📡 [广播指令] {action}: {code} | 股数: {shares} | 信号价: {price:.2f} | ID: {order_id} | 原因: {reason}")

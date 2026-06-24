@@ -12,11 +12,57 @@ import threading
 import requests
 import jsonschema
 from jsonschema import validate, ValidationError
+from datetime import datetime, timezone
 
 from datahub.storage import get_db_conn
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+STALE_THRESHOLD_MINUTES = 240
+
+def parse_datetime_safe(value):
+    if not value:
+        return None
+    try:
+        v = str(value).replace('Z', '+00:00')
+        return datetime.fromisoformat(v)
+    except Exception:
+        pass
+    
+    try:
+        return datetime.strptime(str(value).split('.')[0].strip(), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+def compute_stale_flag(publish_time_dt, now=None):
+    if not publish_time_dt:
+        return 1
+    if now is None:
+        if publish_time_dt.tzinfo is not None:
+            now = datetime.now(timezone.utc)
+        else:
+            now = datetime.now()
+    try:
+        diff_minutes = (now - publish_time_dt).total_seconds() / 60.0
+        if -1440 <= diff_minutes <= STALE_THRESHOLD_MINUTES:
+            return 0
+    except Exception:
+        pass
+    return 1
+
+def extract_source_url(raw_data):
+    if not raw_data:
+        return ""
+    try:
+        data = json.loads(raw_data)
+        if isinstance(data, dict):
+            for key in ['url', 'source_url', 'link']:
+                if key in data and data.get(key):
+                    return str(data[key])
+    except Exception:
+        pass
+    return ""
 
 def setup_tables():
     with get_db_conn() as conn:
@@ -120,7 +166,7 @@ def worker_process_raw_news():
         try:
             with get_db_conn() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT id, symbol, title, content, content_hash FROM raw_news WHERE status = 'raw' LIMIT 50")
+                cursor.execute("SELECT id, symbol, title, content, publish_time, created_at, provider, raw_data, content_hash FROM raw_news WHERE status = 'raw' LIMIT 50")
                 rows = cursor.fetchall()
                 
                 if not rows:
@@ -132,15 +178,36 @@ def worker_process_raw_news():
                     symbol = row['symbol']
                     title = row['title'] or ''
                     content = row['content'] or ''
+                    raw_publish_time = row['publish_time']
+                    raw_created_at = row['created_at']
+                    provider = row['provider']
+                    raw_data = row['raw_data']
                     content_hash = row['content_hash']
+                    
+                    source_url = extract_source_url(raw_data)
+                    if not source_url:
+                        logger.info(f"[EVENT_SOURCE_URL_MISSING] Source URL not found for news_id {news_id}")
+                        
+                    publish_time_dt = parse_datetime_safe(raw_publish_time)
+                    if publish_time_dt:
+                        publish_time_str = raw_publish_time
+                        stale = compute_stale_flag(publish_time_dt)
+                    else:
+                        publish_time_str = raw_publish_time
+                        stale = 1
+                        logger.warning(f"[EVENT_PUBLISH_TIME_MISSING] Missing or invalid publish_time for news_id {news_id}")
+                        
+                    fetch_time = raw_created_at if raw_created_at else datetime.now().isoformat()
                     
                     if content_hash:
                         cursor.execute("SELECT event_type, summary, polarity, key_facts, confidence, novelty, risk_flags FROM event_cards WHERE content_hash = ? LIMIT 1", (content_hash,))
                         existing_card = cursor.fetchone()
                         if existing_card:
+                            logger.info(f"[EVENT_CARD_INSERT] Reusing event_card for news_id {news_id}")
+                            logger.info(f"[EVENT_CARD_STALE] news_id {news_id} stale flag is {stale}")
                             cursor.execute('''
-                                INSERT INTO event_cards (symbol, event_type, summary, source_news_id, polarity, key_facts, content_hash, confidence, novelty, risk_flags)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                INSERT INTO event_cards (symbol, event_type, summary, source_news_id, polarity, key_facts, content_hash, confidence, novelty, risk_flags, publish_time, fetch_time, stale, source_url)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             ''', (
                                 symbol,
                                 existing_card['event_type'],
@@ -151,11 +218,14 @@ def worker_process_raw_news():
                                 content_hash,
                                 existing_card['confidence'],
                                 existing_card['novelty'],
-                                existing_card['risk_flags']
+                                existing_card['risk_flags'],
+                                publish_time_str,
+                                fetch_time,
+                                stale,
+                                source_url
                             ))
                             cursor.execute("UPDATE raw_news SET status = 'processed' WHERE id = ?", (news_id,))
                             conn.commit()
-                            logger.info(f"Reused existing event_card for news_id {news_id} (symbol {symbol}) due to identical content_hash")
                             continue
                     
                     combined_text = f"{title}. {content}"
@@ -175,9 +245,12 @@ def worker_process_raw_news():
                         continue
                     
                     key_facts_json = json.dumps(event_card.get('key_facts', []), ensure_ascii=False)
+                    
+                    logger.info(f"[EVENT_CARD_INSERT] Generated new event_card for news_id {news_id}")
+                    logger.info(f"[EVENT_CARD_STALE] news_id {news_id} stale flag is {stale}")
                     cursor.execute('''
-                        INSERT INTO event_cards (symbol, event_type, summary, source_news_id, polarity, key_facts, content_hash, confidence, novelty, risk_flags)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO event_cards (symbol, event_type, summary, source_news_id, polarity, key_facts, content_hash, confidence, novelty, risk_flags, publish_time, fetch_time, stale, source_url)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         event_card['symbol'],
                         event_card['event_type'],
@@ -188,7 +261,11 @@ def worker_process_raw_news():
                         content_hash,
                         event_card['confidence'],
                         event_card['novelty'],
-                        event_card['risk_flags']
+                        event_card['risk_flags'],
+                        publish_time_str,
+                        fetch_time,
+                        stale,
+                        source_url
                     ))
                     
                     cursor.execute("UPDATE raw_news SET status = 'processed' WHERE id = ?", (news_id,))

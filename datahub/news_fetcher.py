@@ -66,10 +66,67 @@ class EastMoneyProvider(NewsProvider):
         super().__init__('eastmoney')
 
     def fetch(self, symbol):
-        # EastMoney specific fetcher logic (fallback)
+        import requests
+        import json
+        import re
+        from datetime import datetime
+        
         logger.info(f"Fetching from EastMoney API directly for {symbol}")
-        # Assuming minimal fallback logic or returning empty to avoid crash if not implemented
-        return []
+        url = "https://search-api-web.eastmoney.com/search/jsonp"
+        inner_param = {
+            "uid": "",
+            "keyword": symbol,
+            "type": ["cmsArticleWebOld"],
+            "client": "web",
+            "clientType": "web",
+            "clientVersion": "curr",
+            "param": {
+                "cmsArticleWebOld": {
+                    "searchScope": "default",
+                    "sort": "default",
+                    "pageIndex": 1,
+                    "pageSize": 10,
+                    "preTag": "<em>",
+                    "postTag": "</em>",
+                }
+            },
+        }
+        params = {
+            "cb": "jQuery123456",
+            "param": json.dumps(inner_param, ensure_ascii=False),
+            "_": str(int(time.time() * 1000)),
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": f"https://so.eastmoney.com/news/s?keyword={symbol}"
+        }
+        
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        text = response.text
+        match = re.search(r'jQuery123456\((.*)\)', text)
+        if not match:
+            raise ValueError("Invalid JSONP response")
+            
+        data = json.loads(match.group(1))
+        articles = data.get("result", {}).get("cmsArticleWebOld", [])
+        
+        results = []
+        for row in articles:
+            title = re.sub(r'</?em>', '', row.get("title", ""))
+            content = re.sub(r'</?em>', '', row.get("content", ""))
+            content = content.replace('\u3000', '').replace('\r\n', ' ')
+            
+            results.append({
+                'title': title,
+                'content': content,
+                'publish_time': row.get("date", datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+                'provider': 'eastmoney',
+                'raw_data': json.dumps(row, ensure_ascii=False)
+            })
+        
+        return results
 
 def save_news(symbol, provider_name, news_items):
     import re
@@ -165,25 +222,32 @@ def scheduler_loop():
                         
                 try:
                     news_items = fetch_worker(current_provider, symbol, timeout=20)
-                    circuit_breaker.success(current_provider.name)
                     if news_items:
+                        circuit_breaker.success(current_provider.name)
                         save_news(symbol, current_provider.name, news_items)
                         logger.info(f"Saved {len(news_items)} news items for {symbol} from {current_provider.name}.")
+                    else:
+                        logger.info(f"[PROVIDER_NO_DATA] {current_provider.name} returned empty news for {symbol}.")
                 except Exception as e:
                     circuit_breaker.failure(current_provider.name)
-                    logger.error(f"Fetch failed for {current_provider.name}: {e}")
+                    logger.error(f"[PROVIDER_FAIL] Fetch failed for {current_provider.name} on {symbol}: {e}")
                     
                     if current_provider == primary_provider:
                         logger.info(f"[PROVIDER_FAILOVER] Immediate fallback to {fallback_provider.name} after primary failure.")
                         try:
                             if circuit_breaker.allow(fallback_provider.name):
                                 news_items = fetch_worker(fallback_provider, symbol, timeout=20)
-                                circuit_breaker.success(fallback_provider.name)
                                 if news_items:
+                                    circuit_breaker.success(fallback_provider.name)
                                     save_news(symbol, fallback_provider.name, news_items)
+                                    logger.info(f"Saved {len(news_items)} news items for {symbol} from {fallback_provider.name}.")
+                                else:
+                                    logger.info(f"[PROVIDER_NO_DATA] Fallback {fallback_provider.name} returned empty news for {symbol}.")
+                            else:
+                                logger.warning(f"[PROVIDER_FAILOVER] Circuit breaker open for fallback {fallback_provider.name}, skipping.")
                         except Exception as fb_e:
                             circuit_breaker.failure(fallback_provider.name)
-                            logger.error(f"Fallback fetch failed: {fb_e}")
+                            logger.error(f"[PROVIDER_FAIL] Fallback fetch failed for {fallback_provider.name} on {symbol}: {fb_e}")
             
         except Exception as e:
             logger.error(f"Scheduler loop error: {e}")

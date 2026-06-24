@@ -148,6 +148,90 @@ def phase_daily_settlement():
     save_portfolio(portfolio)
     logger.info(f"结算完成。当日净值: ¥{total_equity:.2f} | 现金: ¥{portfolio['cash']:.2f}")
 
+TRADE_SIGNAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "code": {"type": "string"},
+        "symbol": {"type": "string"},
+        "action": {"type": "string", "enum": ["BUY", "SELL", "REDUCE", "VETO", "HOLD"]},
+        "source": {"type": "string", "minLength": 1},
+        "trade_id": {"type": "string", "minLength": 1},
+        "decision_id": {"type": "string"},
+        "event_ids": {"type": "array", "items": {"type": ["integer", "string"]}},
+        "shares": {"type": ["number", "integer"], "minimum": 0},
+        "signal_price": {"type": "number", "minimum": 0},
+        "timestamp": {"type": "string"}
+    },
+    "required": ["action", "source", "trade_id", "decision_id", "event_ids", "shares", "signal_price", "timestamp"],
+    "anyOf": [
+        {"required": ["code"]},
+        {"required": ["symbol"]}
+    ]
+}
+
+executed_ids = OrderedDict()
+MAX_CACHE_SIZE = 500
+
+def process_trade_signal_message(topic, payload):
+    try:
+        order = json.loads(payload)
+        jsonschema.validate(instance=order, schema=TRADE_SIGNAL_SCHEMA)
+    except jsonschema.ValidationError as ve:
+        logger.error(f"[TRADE_SIGNAL_SCHEMA_FAIL] ZMQ message schema invalid: {ve.message}")
+        return
+    except json.JSONDecodeError as e:
+        logger.error(f"[TRADE_SIGNAL_SCHEMA_FAIL] Invalid JSON payload: {e}")
+        return
+        
+    code = order.get("code") or order.get("symbol")
+    if not code:
+        logger.error("[TRADE_SIGNAL_SCHEMA_FAIL] Missing code/symbol")
+        return
+    order["code"] = code
+    
+    action = order.get("action", "").upper()
+    shares = order.get("shares", 0)
+    signal_price = order.get("signal_price", 0)
+    
+    if action in ["BUY", "SELL", "REDUCE"]:
+        if shares <= 0:
+            logger.error(f"[TRADE_SIGNAL_SCHEMA_FAIL] shares <= 0 for action {action}")
+            return
+        if signal_price <= 0:
+            logger.error(f"[TRADE_SIGNAL_SCHEMA_FAIL] signal_price <= 0 for action {action}")
+            return
+            
+    trade_id = order.get("trade_id")
+    if not trade_id:
+        logger.error("[TRADE_SIGNAL_SCHEMA_FAIL] Missing trade_id")
+        return
+        
+    if order.get("event_ids") is None:
+        logger.error("[TRADE_SIGNAL_SCHEMA_FAIL] event_ids cannot be null")
+        return
+        
+    order["order_id"] = order.get("order_id", trade_id)
+    
+    current_state = get_trading_state()
+    if not final_execution_gate(order, current_state, order.get("source", "TRADE_SIGNAL")):
+        return
+    
+    if action == "VETO":
+        logger.info(f"[{code}] Veto signal received, ignoring.")
+        return
+    
+    if trade_id in executed_ids:
+        executed_ids.move_to_end(trade_id)
+        logger.warning(f"⚠️ [幂等拦截] 截获重复指令 ID: {trade_id}，已自动丢弃并忽略")
+        return
+    executed_ids[trade_id] = True
+    if len(executed_ids) > MAX_CACHE_SIZE:
+        executed_ids.popitem(last=False)
+    
+    logger.info(f"\n🎯 [瞬时截获指令] {action} {code} (Source: {order.get('source')})")
+    
+    execute_single_order(order)
+
 def run_fast_hand():
     logger.info("=" * 70)
     logger.info("⚡ 实盘快手节点 (Fast Hand) 已启动")
@@ -173,33 +257,28 @@ def run_fast_hand():
     # 挂载 ZeroMQ 监听器
     context = zmq.Context()
     
-    # 战术总线 (PUB/SUB 5555)
+    # 战术总线 (PUB/SUB 5555 and 5557)
     socket = context.socket(zmq.SUB)
     socket.setsockopt(zmq.RCVHWM, 1000)
-    socket.connect("tcp://127.0.0.1:5555")
     socket.setsockopt_string(zmq.SUBSCRIBE, "TRADE_SIGNAL")
-
-    TRADE_SIGNAL_SCHEMA = {
-        "type": "object",
-        "properties": {
-            "symbol": {"type": "string"},
-            "action": {"type": "string"},
-            "source": {"type": "string"},
-            "event_ids": {"type": "array"}
-        },
-        "required": ["symbol", "action", "source"]
-    }
+    
+    endpoints = ["tcp://127.0.0.1:5555", "tcp://127.0.0.1:5557"]
+    connected_endpoints = []
+    for ep in endpoints:
+        try:
+            socket.connect(ep)
+            connected_endpoints.append(ep)
+            logger.info(f"[ZMQ_CONNECT] Successfully connected to {ep}")
+        except Exception as e:
+            logger.error(f"[ZMQ_CONNECT_FAIL] Failed to connect to {ep}: {e}")
 
     # 控制总线 (REQ/REP 5556)
     control_socket = context.socket(zmq.REP)
     control_socket.bind("tcp://127.0.0.1:5556")
 
     settled_today = False
-    logger.info("[快手] 正在监听大模型战术指挥网 (TCP 5555)...")
+    logger.info(f"[快手] 正在监听战术指挥网节点: {connected_endpoints}")
     logger.info("[快手] 正在监听全局风控控制总线 (TCP 5556)...")
-
-    executed_ids = OrderedDict()
-    max_cache_size = 500
 
     while True:
         now = datetime.now()
@@ -234,40 +313,10 @@ def run_fast_hand():
         # 1. 极速非阻塞监听 (0.01秒心跳)
         try:
             message = socket.recv_string(flags=zmq.NOBLOCK)
-            _, payload = message.split(" ", 1)
-            try:
-                order = json.loads(payload)
-                jsonschema.validate(instance=order, schema=TRADE_SIGNAL_SCHEMA)
-            except jsonschema.ValidationError as ve:
-                logger.error(f"[SCHEMA_VALIDATION_FAIL] ZMQ message schema invalid: {ve.message}")
-                continue
-            except json.JSONDecodeError as e:
-                logger.error(f"[SCHEMA_VALIDATION_FAIL] Invalid JSON payload: {e}")
-                continue
-            
-            current_state = get_trading_state()
-            if not final_execution_gate(order, current_state, order.get("source", "TRADE_SIGNAL")):
-                continue
-            
-            if order.get("action") == "veto":
-                logger.info(f"[{order.get('symbol')}] Veto signal received, ignoring.")
-                continue
-            
-            # 校验指纹 ID 幂等性
-            order_id = order.get("trade_id") or order.get("order_id")
-            if order_id:
-                if order_id in executed_ids:
-                    executed_ids.move_to_end(order_id)
-                    logger.warning(f"⚠️ [幂等拦截] 截获重复指令 ID: {order_id}，已自动丢弃并忽略")
-                    continue
-                executed_ids[order_id] = True
-                if len(executed_ids) > max_cache_size:
-                    executed_ids.popitem(last=False)
-            
-            logger.info(f"\n🎯 [瞬时截获指令] {order['action']} {order.get('symbol')} (Source: {order.get('source')})")
-            
-            # 瞬间开火
-            execute_single_order(order)
+            parts = message.split(" ", 1)
+            if len(parts) == 2:
+                topic, payload = parts
+                process_trade_signal_message(topic, payload)
         except zmq.Again:
             pass # 当前无信号，放行
 
