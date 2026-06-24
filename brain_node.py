@@ -33,7 +33,25 @@ LIVE_UNIVERSE = BACKTEST_UNIVERSE
 # 跨日时（检测到日期变化）自动清空集合
 _dca_traded_today = set()
 _last_dca_date = datetime.now().date()
-_last_index_change_pct = 0.0  # 增加：大盘风控缓存
+_last_index_change_pct = None  # 增加：大盘风控缓存
+
+def _get_index_change_pct_from_cache():
+    """从本地缓存文件读取大盘跌幅"""
+    cache_file = os.path.join(PROJECT_ROOT, "data_cache", "index_sh000001.json")
+    try:
+        if os.path.exists(cache_file):
+            with open(cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            if time.time() - data.get("ts", 0) > 300:
+                logger.warning("[INDEX_CACHE_STALE] 大盘缓存文件超过5分钟未更新，准备 fallback 到内存缓存")
+                return None
+            return float(data.get("change_pct", 0.0))
+        else:
+            logger.warning("[INDEX_CACHE_MISSING] 大盘缓存文件不存在，准备 fallback 到内存缓存")
+    except Exception as e:
+        logger.warning(f"[风控预警] 读取大盘缓存失败: {e}")
+    return None
 
 class LRUStockHistory(OrderedDict):
     def __init__(self, maxsize=50, *args, **kwargs):
@@ -144,23 +162,24 @@ def run_slow_brain():
         # ==========================================
         systemic_risk_halt = False
         global _last_index_change_pct
+        
         try:
-            import requests
-            resp = requests.get("http://hq.sinajs.cn/list=s_sh000001", timeout=8)
-            if resp.status_code == 200:
-                data_part = resp.text.split('"')[1]
-                fields = data_part.split(',')
-                if len(fields) >= 4:
-                    index_change_pct = float(fields[3])
-                    _last_index_change_pct = index_change_pct
-                    if index_change_pct <= -2.5:
-                        systemic_risk_halt = True
-                        logger.error(f"🚨 [风控拦截] 上证指数跌幅 {index_change_pct}% >= 2.5%，触发全局系统性风险规避，本轮禁止买入！")
-        except Exception as e:
-            logger.warning(f"[风控检测] 获取大盘指数失败，使用最后缓存值 {_last_index_change_pct}%: {e}")
+            index_change_pct = _get_index_change_pct_from_cache()
+            if index_change_pct is not None:
+                _last_index_change_pct = index_change_pct
+            else:
+                # 缓存为空或超过5分钟，fallback 到内存缓存
+                if _last_index_change_pct is None:
+                    # 内存缓存也为空，默认进入保守模式 (-999.0)
+                    logger.warning("[INDEX_CACHE_MISSING] 大盘缓存与内存缓存均为空，默认进入保守模式！")
+                    _last_index_change_pct = -999.0
+                    
             if _last_index_change_pct <= -2.5:
                 systemic_risk_halt = True
-                logger.error(f"🚨 [风控拦截] (基于缓存) 上证指数跌幅 {_last_index_change_pct}% >= 2.5%，触发全局系统性风险规避，本轮禁止买入！")
+                logger.error(f"🚨 [风控拦截] 上证指数跌幅 {_last_index_change_pct}% <= -2.5%，触发全局系统性风险规避，本轮禁止买入！")
+        except Exception as e:
+            logger.warning(f"[风控预警] 大盘检测逻辑异常，保守拦截: {e}")
+            systemic_risk_halt = True
 
         # 2. 获取实时行情 - ThreadPoolExecutor 并发拉取
         daily_quotes = []

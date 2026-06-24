@@ -9,7 +9,7 @@ LLAMA_ADVISOR_PROMPT_TEMPLATE = {
   },
   "expected_output_format": {
     "symbol": "string",
-    "action": "BUY | SELL | HOLD",
+    "risk_opinion": "positive | negative | neutral (注意：LLM 不能直接生成下单指令，仅作为辅助风控评估)",
     "stop_loss_pct": "float",
     "sector_exposure": "string",
     "ai_veto": "boolean (是否否决规则引擎信号)"

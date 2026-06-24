@@ -10,6 +10,7 @@ import zmq
 from datetime import datetime
 from collections import OrderedDict
 from dotenv import load_dotenv
+import jsonschema
 
 # 添加项目根目录到 Python 路径，确保 core 和 feeds 模块可被引用
 PROJECT_ROOT = os.path.dirname(__file__)
@@ -38,14 +39,64 @@ else:
 # 挂载全局订单生命周期管理器
 order_manager = OrderManager(broker)
 
+def final_execution_gate(order, current_state, source):
+    from core.trading_state import TradingState
+    code = order.get("code") or order.get("symbol")
+    action = order.get("action")
+    shares = order.get("shares", 100)
+    
+    if not code or not action:
+        logger.warning(f"🛑 [FINAL_EXECUTION_GATE] 拦截: 缺少 code 或 action (Source: {source})")
+        if source == "MANUAL_ORDER":
+            logger.warning("🛑 [MANUAL_ORDER_BLOCK] 手动发单指令缺少必要字段")
+        return False
+        
+    action_upper = str(action).upper()
+    if action_upper not in ["BUY", "SELL", "REDUCE", "CONFIRM", "VETO"]:
+        logger.warning(f"🛑 [FINAL_EXECUTION_GATE] 拦截: 非法 action {action} (Source: {source})")
+        if source == "MANUAL_ORDER":
+            logger.warning(f"🛑 [MANUAL_ORDER_BLOCK] 手动发单指令异常")
+        return False
+        
+    if "shares" in order and shares <= 0:
+        logger.warning(f"🛑 [FINAL_EXECUTION_GATE] 拦截: shares <= 0 (Source: {source})")
+        if source == "MANUAL_ORDER":
+            logger.warning("🛑 [MANUAL_ORDER_BLOCK] 交易数量非法")
+        return False
+        
+    if current_state in [TradingState.FROZEN.value, TradingState.EMERGENCY.value, "FROZEN", "EMERGENCY"]:
+        if action_upper in ["BUY", "CONFIRM"]:
+            if "EMERGENCY" in str(current_state):
+                logger.warning(f"🛑 [EMERGENCY_BLOCK] 紧急锁定，彻底阻断买入 {code} (Source: {source})")
+            else:
+                logger.warning(f"🛑 [FROZEN_BLOCK] 系统冻结，彻底阻断买入 {code} (Source: {source})")
+                
+            if source == "MANUAL_ORDER":
+                logger.warning(f"🛑 [MANUAL_ORDER_BLOCK] 手动干预被当前状态 {current_state} 强制拦截！")
+            return False
+        elif action_upper in ["SELL", "REDUCE"]:
+            logger.warning(f"⚠️ [FINAL_EXECUTION_GATE] 允许 {current_state} 状态下的减仓/卖出动作: {code} (Source: {source})")
+            return True
+        else:
+            if "EMERGENCY" in str(current_state):
+                logger.warning(f"🛑 [EMERGENCY_BLOCK] 阻断未知 action: {action} (Source: {source})")
+            else:
+                logger.warning(f"🛑 [FROZEN_BLOCK] 阻断未知 action: {action} (Source: {source})")
+            return False
+            
+    return True
+
 def execute_single_order(order):
     """原子化交易执行器（异步委托交由 OrderManager 处理）"""
-    code = order["code"]
+    code = order.get("code") or order.get("symbol")
     action = order["action"]
-    shares = order["shares"]
+    shares = order.get("shares", 100)
     fill_price = order.get("signal_price", 0.0)
     name = order.get("name", code)
     reason = order.get("reason", "")
+    decision_id = order.get("decision_id", "")
+    event_ids = order.get("event_ids", [])
+    source = order.get("source", "unknown")
 
     price_type = "限价" if fill_price > 0 else "市价"
     
@@ -58,6 +109,20 @@ def execute_single_order(order):
             price_type=price_type, 
             price=fill_price
         )
+        
+        import json
+        audit_log = {
+            "order_id": order_id,
+            "decision_id": decision_id,
+            "event_ids": event_ids,
+            "source": source,
+            "symbol": code,
+            "action": action,
+            "shares": shares,
+            "event_type": "TRADE_EXECUTION"
+        }
+        logger.info(f"[TRADE_TRACE] {json.dumps(audit_log, ensure_ascii=False)}")
+        
         # 2. 将订单交由状态机托管对账
         order_manager.add_order(order_id, code, action, shares, reason)
     except Exception as e:
@@ -110,8 +175,20 @@ def run_fast_hand():
     
     # 战术总线 (PUB/SUB 5555)
     socket = context.socket(zmq.SUB)
+    socket.setsockopt(zmq.RCVHWM, 1000)
     socket.connect("tcp://127.0.0.1:5555")
     socket.setsockopt_string(zmq.SUBSCRIBE, "TRADE_SIGNAL")
+
+    TRADE_SIGNAL_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string"},
+            "action": {"type": "string"},
+            "source": {"type": "string"},
+            "event_ids": {"type": "array"}
+        },
+        "required": ["symbol", "action", "source"]
+    }
 
     # 控制总线 (REQ/REP 5556)
     control_socket = context.socket(zmq.REP)
@@ -140,8 +217,12 @@ def run_fast_hand():
                 elif cmd == "MANUAL_ORDER":
                     order = ctrl_data.get("order")
                     logger.warning(f"⚡ [风控] 收到手动干预直达订单: {order.get('action')} {order.get('code')}")
-                    execute_single_order(order)
-                    control_socket.send_string(json.dumps({"status": "ACK"}))
+                    current_state = get_trading_state()
+                    if final_execution_gate(order, current_state, "MANUAL_ORDER"):
+                        execute_single_order(order)
+                        control_socket.send_string(json.dumps({"status": "ACK"}))
+                    else:
+                        control_socket.send_string(json.dumps({"status": "NACK", "reason": "Blocked by final_execution_gate"}))
                 else:
                     control_socket.send_string(json.dumps({"status": "NACK", "reason": "Unknown command"}))
             except Exception as e:
@@ -154,17 +235,26 @@ def run_fast_hand():
         try:
             message = socket.recv_string(flags=zmq.NOBLOCK)
             _, payload = message.split(" ", 1)
-            order = json.loads(payload)
+            try:
+                order = json.loads(payload)
+                jsonschema.validate(instance=order, schema=TRADE_SIGNAL_SCHEMA)
+            except jsonschema.ValidationError as ve:
+                logger.error(f"[SCHEMA_VALIDATION_FAIL] ZMQ message schema invalid: {ve.message}")
+                continue
+            except json.JSONDecodeError as e:
+                logger.error(f"[SCHEMA_VALIDATION_FAIL] Invalid JSON payload: {e}")
+                continue
             
-            # 物理阻断检查
             current_state = get_trading_state()
-            if current_state in [TradingState.FROZEN.value, TradingState.EMERGENCY.value]:
-                if order.get("action") == "BUY":
-                    logger.warning(f"🛑 [风控拦截] 系统状态为 {current_state}，已物理丢弃战术买入指令: {order.get('code')}")
-                    continue
+            if not final_execution_gate(order, current_state, order.get("source", "TRADE_SIGNAL")):
+                continue
+            
+            if order.get("action") == "veto":
+                logger.info(f"[{order.get('symbol')}] Veto signal received, ignoring.")
+                continue
             
             # 校验指纹 ID 幂等性
-            order_id = order.get("order_id")
+            order_id = order.get("trade_id") or order.get("order_id")
             if order_id:
                 if order_id in executed_ids:
                     executed_ids.move_to_end(order_id)
@@ -174,7 +264,7 @@ def run_fast_hand():
                 if len(executed_ids) > max_cache_size:
                     executed_ids.popitem(last=False)
             
-            logger.info(f"\n🎯 [瞬时截获指令] {order['action']} {order['code']} ({order['reason']})")
+            logger.info(f"\n🎯 [瞬时截获指令] {order['action']} {order.get('symbol')} (Source: {order.get('source')})")
             
             # 瞬间开火
             execute_single_order(order)

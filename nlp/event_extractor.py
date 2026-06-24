@@ -10,6 +10,8 @@ import logging
 import sqlite3
 import threading
 import requests
+import jsonschema
+from jsonschema import validate, ValidationError
 
 from datahub.storage import get_db_conn
 
@@ -22,16 +24,6 @@ def setup_tables():
         
         try:
             cursor.execute('ALTER TABLE raw_news ADD COLUMN status TEXT DEFAULT "raw"')
-        except sqlite3.OperationalError:
-            pass
-            
-        try:
-            cursor.execute('ALTER TABLE event_cards ADD COLUMN polarity TEXT')
-        except sqlite3.OperationalError:
-            pass
-            
-        try:
-            cursor.execute('ALTER TABLE event_cards ADD COLUMN key_facts TEXT')
         except sqlite3.OperationalError:
             pass
             
@@ -62,17 +54,26 @@ def clean_text(raw_text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+EVENT_CARD_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "symbol": {"type": "string"},
+        "event_type": {"type": "string"},
+        "polarity": {"type": "string", "enum": ["positive", "negative", "neutral"]},
+        "summary": {"type": "string"},
+        "key_facts": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "novelty": {"type": "number", "minimum": 0, "maximum": 1},
+        "risk_flags": {"type": "string"}
+    },
+    "required": ["symbol", "event_type", "polarity", "summary", "key_facts", "confidence", "novelty", "risk_flags"]
+}
+
 def generate_event_card(news_id, symbol, cleaned_text):
     prompt = f"""
 Please extract an event card from the following news text. 
 Strictly return ONLY a valid JSON object with this exact structure:
-{{
-  "symbol": "{symbol}",
-  "event_type": "Company News|Market Event|Policy Change|Other",
-  "polarity": "positive|negative|neutral",
-  "summary": "Brief summary max 50 chars",
-  "key_facts": ["fact1", "fact2"]
-}}
+{json.dumps(EVENT_CARD_SCHEMA)}
 
 Text:
 {cleaned_text[:2000]}
@@ -92,28 +93,24 @@ Text:
             result_json = response.json().get('response', '{}')
             parsed = json.loads(result_json)
             
+            try:
+                validate(instance=parsed, schema=EVENT_CARD_SCHEMA)
+            except ValidationError as ve:
+                logger.error(f"[SCHEMA_VALIDATION_FAIL] EventExtractor LLM schema mismatch: {ve.message}")
+                return None
+            
             if len(parsed.get('summary', '')) > 50:
                 parsed['summary'] = parsed['summary'][:47] + '...'
                 
-            return {
-                "symbol": str(parsed.get('symbol', symbol)),
-                "event_type": str(parsed.get('event_type', 'Other')),
-                "polarity": str(parsed.get('polarity', 'neutral')),
-                "summary": str(parsed.get('summary', '')),
-                "key_facts": [str(k) for k in parsed.get('key_facts', [])]
-            }
+            return parsed
+            
     except requests.exceptions.RequestException as e:
-        logger.warning(f"Local LLaMA call failed for news_id {news_id}, falling back to rules: {e}")
+        logger.warning(f"Local LLaMA call failed for news_id {news_id}: {e}")
     except json.JSONDecodeError as e:
         logger.warning(f"Failed to parse JSON from LLaMA for news_id {news_id}: {e}")
         
-    return {
-        "symbol": symbol,
-        "event_type": "Other",
-        "polarity": "neutral",
-        "summary": cleaned_text[:50],
-        "key_facts": [cleaned_text[:100]]
-    }
+    logger.error(f"[SCHEMA_VALIDATION_FAIL] Fallback generation skipped to prevent bad data.")
+    return None
 
 def worker_process_raw_news():
     setup_tables()
@@ -123,7 +120,7 @@ def worker_process_raw_news():
         try:
             with get_db_conn() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT id, symbol, title, content FROM raw_news WHERE status = 'raw' LIMIT 50")
+                cursor.execute("SELECT id, symbol, title, content, content_hash FROM raw_news WHERE status = 'raw' LIMIT 50")
                 rows = cursor.fetchall()
                 
                 if not rows:
@@ -135,6 +132,31 @@ def worker_process_raw_news():
                     symbol = row['symbol']
                     title = row['title'] or ''
                     content = row['content'] or ''
+                    content_hash = row['content_hash']
+                    
+                    if content_hash:
+                        cursor.execute("SELECT event_type, summary, polarity, key_facts, confidence, novelty, risk_flags FROM event_cards WHERE content_hash = ? LIMIT 1", (content_hash,))
+                        existing_card = cursor.fetchone()
+                        if existing_card:
+                            cursor.execute('''
+                                INSERT INTO event_cards (symbol, event_type, summary, source_news_id, polarity, key_facts, content_hash, confidence, novelty, risk_flags)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ''', (
+                                symbol,
+                                existing_card['event_type'],
+                                existing_card['summary'],
+                                news_id,
+                                existing_card['polarity'],
+                                existing_card['key_facts'],
+                                content_hash,
+                                existing_card['confidence'],
+                                existing_card['novelty'],
+                                existing_card['risk_flags']
+                            ))
+                            cursor.execute("UPDATE raw_news SET status = 'processed' WHERE id = ?", (news_id,))
+                            conn.commit()
+                            logger.info(f"Reused existing event_card for news_id {news_id} (symbol {symbol}) due to identical content_hash")
+                            continue
                     
                     combined_text = f"{title}. {content}"
                     cleaned_text = clean_text(combined_text)
@@ -146,17 +168,27 @@ def worker_process_raw_news():
                     
                     event_card = generate_event_card(news_id, symbol, cleaned_text)
                     
+                    if not event_card:
+                        logger.warning(f"[SCHEMA_VALIDATION_FAIL] Skipping news_id {news_id} because of bad AI generation")
+                        cursor.execute("UPDATE raw_news SET status = 'skipped_bad_schema' WHERE id = ?", (news_id,))
+                        conn.commit()
+                        continue
+                    
                     key_facts_json = json.dumps(event_card.get('key_facts', []), ensure_ascii=False)
                     cursor.execute('''
-                        INSERT INTO event_cards (symbol, event_type, summary, source_news_id, polarity, key_facts)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        INSERT INTO event_cards (symbol, event_type, summary, source_news_id, polarity, key_facts, content_hash, confidence, novelty, risk_flags)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
                         event_card['symbol'],
                         event_card['event_type'],
                         event_card['summary'],
                         news_id,
                         event_card['polarity'],
-                        key_facts_json
+                        key_facts_json,
+                        content_hash,
+                        event_card['confidence'],
+                        event_card['novelty'],
+                        event_card['risk_flags']
                     ))
                     
                     cursor.execute("UPDATE raw_news SET status = 'processed' WHERE id = ?", (news_id,))
