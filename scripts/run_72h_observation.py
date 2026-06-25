@@ -139,13 +139,23 @@ def generate_paper_trading_report():
     analyzer = PaperPerformanceAnalyzer()
     stats = analyzer.analyze(window_hours=72)
 
+    # 输出 JSON
+    analyzer.write_json(
+        stats,
+        os.path.join(PROJECT_ROOT, "data_cache", "paper_performance.json")
+    )
+
     # 输出新格式报告（详细绩效）
-    perf_md_path = os.path.join(PROJECT_ROOT, "reports", "paper_trading_performance.md")
-    analyzer.write_markdown_report(stats, path=perf_md_path)
+    analyzer.write_markdown_report(
+        stats,
+        os.path.join(PROJECT_ROOT, "reports", "paper_trading_performance.md")
+    )
 
     # 保持旧路径兼容
-    report_path = os.path.join(PROJECT_ROOT, "reports", "paper_trading_observation.md")
-    analyzer.write_markdown_report(stats, path=report_path)
+    analyzer.write_markdown_report(
+        stats,
+        os.path.join(PROJECT_ROOT, "reports", "paper_trading_observation.md")
+    )
 
 def generate_news_readonly_report():
     report_path = os.path.join(PROJECT_ROOT, "reports", "news_readonly_observation.md")
