@@ -442,6 +442,35 @@ def run_paper_trade_engine():
                 f" | offset={new_position}"
             )
 
+            # ── 通知推送 (Phase 9.5) ──
+            if stats["filled"] > 0 or stats["rejected"] > 0 or stats["failed"] > 0:
+                try:
+                    from core.notification_service import notify_event
+                    for entry in fill_entries:
+                        status = entry.get("status", "")
+                        code = entry.get("code", "")
+                        action = entry.get("action", "")
+                        qty = entry.get("quantity", 0)
+                        price = entry.get("price", 0)
+                        if status == "FILLED":
+                            notify_event(
+                                "paper_trade",
+                                "模拟盘成交",
+                                symbol=code,
+                                message=f"{action} {code} x{qty} @ {price}\n状态: 成交",
+                                level="info",
+                            )
+                        elif status == "REJECTED":
+                            notify_event(
+                                "paper_trade",
+                                "模拟盘拒单",
+                                symbol=code,
+                                message=f"{action} {code} x{qty} @ {price}\n原因: {entry.get('reason', '未知')}",
+                                level="warning",
+                            )
+                except Exception:
+                    pass  # 通知失败不阻塞主流程
+
         except Exception as e:
             logger.error(f"[PAPER ENGINE] 运行时异常: {e}")
             time.sleep(5)
