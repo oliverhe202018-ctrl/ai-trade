@@ -7,7 +7,21 @@
 
 ---
 
-## 1. Phase 8a: 数据清理（前置条件）
+## 最小实现范围
+
+Phase 8 最小实现仅包含以下交付件，不包含交易策略改动：
+
+| 文件 | 用途 | 类型 |
+|------|------|------|
+| `core/paper_performance_analyzer.py` | 读取 fills + portfolio 生成统计 | 新增 |
+| `data_cache/paper_performance.json` | 结构化绩效数据 | 新增（输出） |
+| `reports/paper_trading_performance.md` | 人类可读绩效报告 | 新增（输出） |
+| `core/paper_trading_provider.py` | Copilot 上下文提供者 | 新增 |
+| 升级 `run_72h_observation.py` | 替换硬编码为 analyzer 调用 | 修改 |
+
+---
+
+## 1. Phase 8a: 数据清理
 
 当前生产数据文件被 Phase 7 验证测试污染：
 

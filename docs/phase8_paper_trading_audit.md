@@ -109,6 +109,8 @@
 
 ### 4.1 ✅ 当前可直接计算（仅依赖 fills + portfolio）
 
+以下明确列出可计算的指标：
+
 | 指标 | 数据源 | 说明 |
 |------|--------|------|
 | `total_signals` | fills (全部记录) | 所有信号总数 |
@@ -132,7 +134,7 @@
 
 ### 4.3 ❌ 当前不可算（标记为 unavailable）
 
-以下指标标记为 unavailable，并附带不可计算原因：
+以下明确列出不可计算的指标，并附带不可计算原因：
 
 | 指标 | 不可计算原因 |
 |------|-------------|
@@ -266,7 +268,8 @@ Phase 8d: 展示层
 ✅ 明确 10 个可直接计算的指标
 ✅ 明确 9 个当前不可算的指标及不可计算原因
 ✅ 输出的 paper_trading_performance.md 数据来自 fills/portfolio（非硬编码）
-✅ 不修改真实交易链路 (live_trader.py, brain_node.py, broker_adapter.py 均不修改)
+✅ 不修改 live_trader.py / brain_node.py / broker_adapter.py
+✅ 不修改真实交易链路
 ✅ 不发送 TRADE_SIGNAL
 ✅ 不连接 QMT 下单
 ✅ 不写 live_portfolio.json / portfolio.json
