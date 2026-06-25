@@ -53,6 +53,7 @@ class PaperPerformanceAnalyzer:
     ):
         self.fills_path = fills_path
         self.portfolio_path = portfolio_path
+        self.json_decode_errors = 0
 
     # ── 数据加载 ──────────────────────────────────────────
 
@@ -76,6 +77,7 @@ class PaperPerformanceAnalyzer:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     json_errors += 1
+                    self.json_decode_errors += 1
                     continue
 
                 if cutoff:
@@ -204,6 +206,7 @@ class PaperPerformanceAnalyzer:
                 "detected": duplicate_count > 0,
                 "count": duplicate_count,
             },
+            "json_decode_errors": self.json_decode_errors,
         }
 
     # ── 不可用指标 ────────────────────────────────────────
@@ -344,6 +347,7 @@ class PaperPerformanceAnalyzer:
             "",
             "## 4. 异常统计",
             "",
+            f"- JSON 解析错误: {a['json_decode_errors']} 次",
             f"- 数据污染: {'⚠️ 检测到' if a['data_pollution']['detected'] else '✅ 无'} "
             f"({a['data_pollution']['polluted_count']} 条)",
             f"- 重复订单: {'⚠️ 检测到' if a['duplicate_order_ids']['detected'] else '✅ 无'} "
