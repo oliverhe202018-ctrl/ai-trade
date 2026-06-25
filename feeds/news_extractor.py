@@ -1,10 +1,3 @@
-"""
-资讯结构化降维提纯模块 (重构版)
-职责：
-1. 三层 Waterfall 获取资讯: 东方财富 AkShare -> 东方财富 Kuaixun HTTP -> 新浪 7x24
-2. 二层降级处理: LLM 提取 -> 规则引擎提取
-3. 输出格式：{"macro_sentiment": 1, "hot_sectors": ["半导体"], "risk_warnings": ["sh600519"], "_source": "...", "_news_count": ...}
-"""
 import json
 import os
 import re
@@ -50,26 +43,37 @@ def fetch_layer1_em_akshare(hours=24):
         cutoff_time = datetime.now() - timedelta(hours=hours)
         
         columns = list(news_df.columns)
-        time_col = next((c for c in columns if '时间' in c or 'time' in c.lower() or 'time' in c), None)
-        content_col = next((c for c in columns if '摘要' in c or '内容' in c or '标题' in c or 'title' in c.lower()), None)
+        KNOWN_COLUMNS = {
+            "time": ["发布时间", "时间", "publish_time"], 
+            "content": ["摘要", "内容", "标题", "title"]
+        }
         
+        time_col = None
+        for col in columns:
+            if any(k in col.lower() for k in KNOWN_COLUMNS["time"]):
+                time_col = col
+                break
+                
+        content_col = None
+        for col in columns:
+            if any(k in col.lower() for k in KNOWN_COLUMNS["content"]):
+                content_col = col
+                break
+                
         if not time_col or not content_col:
-            # Fallback for known akshare columns if matching fails due to encoding
-            # Typically: ['标题', '摘要', '发布时间', '链接']
-            if len(columns) >= 3:
-                time_col = columns[2]
-                content_col = columns[1]
-            else:
-                logger.warning(f"[NEWS-L1] 无法识别数据列: {columns}")
-                return None
+            logger.warning(f"[NEWS-L1] 无法识别数据列: {columns}")
+            return None
         
         for idx, row in news_df.iterrows():
             try:
                 create_time = str(row[time_col])
                 content = str(row[content_col])
                 
-                # Check time valid
-                if ":" not in create_time:
+                try:
+                    news_time = datetime.strptime(create_time, "%Y-%m-%d %H:%M:%S")
+                    if news_time < cutoff_time:
+                        continue
+                except Exception:
                     pass
                 
                 content = re.sub(r"<[^>]+>", "", content).strip()
@@ -89,37 +93,43 @@ def fetch_layer1_em_akshare(hours=24):
 
 def fetch_layer2_em_http(hours=24):
     """Layer-2: 东方财富 Kuaixun HTTP 直连"""
-    url = "https://newsapi.eastmoney.com/kuaixun/v1/getlist_102_ajaxResult_50_1_.html"
+    url = "https://np-listapi.eastmoney.com/comm/web/getFastNewsList"
     try:
         logger.info("[NEWS-L2] 尝试通过东财快讯 HTTP 直连获取数据")
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        params = {
+            "client": "web", 
+            "biz": "web_newnow_kuaixun", 
+            "page": 1, 
+            "pageSize": 50, 
+            "order": 1
         }
-        response = requests.get(url, headers=headers, timeout=10)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Referer": "https://kuaixun.eastmoney.com/"
+        }
+        response = requests.get(url, params=params, headers=headers, timeout=10)
         response.raise_for_status()
-        text = response.text
         
-        # 解析 var ajaxResult={...}
-        match = re.search(r"var\s+ajaxResult\s*=\s*(\{.*?\});", text, re.DOTALL)
-        if not match:
-            # 兼容没有 var ajaxResult= 的纯 JSON 返回
-            try:
-                data = response.json()
-            except:
-                logger.warning("[NEWS-L2] 无法解析 JS 变量 ajaxResult")
-                return None
-        else:
-            json_str = match.group(1)
-            data = json.loads(json_str)
-            
-        list_data = data.get("list", [])
+        data = response.json()
+        list_data = data.get("data", {}).get("list", [])
         if not list_data:
             return None
             
         filtered_news = []
+        cutoff_time = datetime.now() - timedelta(hours=hours)
+        
         for item in list_data:
-            create_time = item.get("showtime", "")
-            content = item.get("title", "") or item.get("digest", "")
+            create_time = item.get("ShowTime") or item.get("showTime", "")
+            content = item.get("Title") or item.get("title", "")
+            
+            try:
+                if create_time:
+                    news_time = datetime.strptime(create_time, "%Y-%m-%d %H:%M:%S")
+                    if news_time < cutoff_time:
+                        continue
+            except Exception:
+                pass
+
             content = re.sub(r"<[^>]+>", "", content).strip()
             if content:
                 filtered_news.append({
@@ -161,14 +171,15 @@ def fetch_layer3_sina_7x24(hours=24, limit_pages=5):
             if not feed_list:
                 break
                 
+            all_stale = True
             for item in feed_list:
                 create_time = item.get("create_time", "")
                 try:
                     news_time = datetime.strptime(create_time, "%Y-%m-%d %H:%M:%S")
                     if news_time >= cutoff_time:
+                        all_stale = False
                         content = item.get("rich_text", "") or item.get("text", "")
                         content = re.sub(r"<[^>]+>", "", content).strip()
-                        # 过滤长度 < 10 的噪声条目
                         if content and len(content) >= 10:
                             filtered_news.append({
                                 "time": create_time,
@@ -176,6 +187,9 @@ def fetch_layer3_sina_7x24(hours=24, limit_pages=5):
                             })
                 except Exception:
                     continue
+                    
+            if all_stale:
+                break
         except Exception as e:
             logger.exception(f"[NEWS-L3] 新浪 7x24 获取失败, page={page}: {e}")
             break
@@ -242,9 +256,16 @@ def _rule_engine_fallback(news_list):
                     sector_counts[sector] += 1
                     
         # 简易风险提取 (股票代码)
-        matches = re.findall(r"(sh60\d{4}|sz00\d{4}|sz30\d{4})", content)
+        matches = re.findall(r"\b(?:sh|sz|bj)([036]\d{5})\b|\(([036]\d{5})\)", content)
         for m in matches:
-            risk_warnings.add(m)
+            code = m[0] or m[1]
+            if code:
+                if code.startswith("6"):
+                    risk_warnings.add(f"sh{code}")
+                elif code.startswith("0") or code.startswith("3"):
+                    risk_warnings.add(f"sz{code}")
+                elif code.startswith("8"):
+                    risk_warnings.add(f"bj{code}")
             
     net = bull_score - bear_score
     if net >= 10:
@@ -321,6 +342,9 @@ def extract_sentiment_with_llm(news_list):
             else:
                 return None, "LLM_PARSE_FAILED"
 
+        if not json_str or not json_str.strip().startswith("{"):
+            return None, "LLM_PARSE_FAILED"
+            
         result = json.loads(json_str)
 
         macro_sentiment = result.get("macro_sentiment", 0)
@@ -352,6 +376,8 @@ def extract_sentiment_with_llm(news_list):
 
 def get_news_sentiment(hours=24):
     """主入口"""
+    llm_online = _check_llm_alive(timeout=5)
+    
     news_list, source = fetch_news_waterfall(hours)
     
     if source == "ALL_FAILED":
@@ -365,8 +391,6 @@ def get_news_sentiment(hours=24):
         
     news_count = len(news_list)
     
-    llm_online = _check_llm_alive(timeout=5)
-    
     if llm_online:
         sentiment, llm_err = extract_sentiment_with_llm(news_list)
         if sentiment:
@@ -376,12 +400,14 @@ def get_news_sentiment(hours=24):
         else:
             logger.warning(f"[NEWS] LLM 提取异常({llm_err})，启用规则引擎降级")
             fallback_res = _rule_engine_fallback(news_list)
-            fallback_res["_source"] = llm_err
+            fallback_res["_source"] = "rule_engine"
+            fallback_res["_llm_err"] = llm_err
             fallback_res["_news_count"] = news_count
             return fallback_res
     else:
         logger.warning("[NEWS] LLM 离线，启用规则引擎降级")
         fallback_res = _rule_engine_fallback(news_list)
+        fallback_res["_source"] = "rule_engine"
         fallback_res["_news_count"] = news_count
         return fallback_res
 
