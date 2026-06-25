@@ -9,149 +9,136 @@ import json
 import zmq
 from datetime import datetime
 from collections import defaultdict, OrderedDict
-from dotenv import load_dotenv
 
 # 添加项目根目录到 Python 路径，确保 core 和 feeds 模块可被引用
-PROJECT_ROOT = os.path.dirname(__file__)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-load_dotenv()
+# ── .env 安全加载：过滤 null 字符键值对（Windows <frozen os> 限制）──
+try:
+    from dotenv import dotenv_values
+    for _k, _v in dotenv_values().items():
+        if _v is not None and "\x00" not in _k and "\x00" not in _v:
+            os.environ.setdefault(_k, _v)
+except Exception as _e:
+    print(f"[DOTENV_ERROR] .env 加载异常，继续运行: {_e}")
+
+# === 资讯情绪模块导入 ===
+try:
+    from feeds.news_extractor import get_news_sentiment
+    _NEWS_AVAILABLE = True
+except Exception as _ne:
+    print(f"[NEWS_IMPORT_WARN] 资讯模块导入失败: {_ne}")
+    _NEWS_AVAILABLE = False
+
 from core.logger_config import logger
 from core.strategy_engine import select_stocks, generate_sell_signals, mean_reversion_scan, calculate_dca_multiplier, determine_market_regime
 from core.risk_manager import calculate_atr, calculate_position_size
 from core.grid_manager import GridManager
 from core.state_manager import load_portfolio
 from core.backtester import download_historical_data, BACKTEST_UNIVERSE
+from core.trading_state import get_trading_state, TradingState
 
 LIVE_UNIVERSE = BACKTEST_UNIVERSE
 
 # ==========================================
 # 🔒 DCA 日内冷却锁（防止同一标的日内重复定投榨干资金）
 # ==========================================
-# 记录今日已执行过定投的标的代码，每只股票每天只允许定投一次
-# 跨日时（检测到日期变化）自动清空集合
-_dca_traded_today = set()
-_last_dca_date = datetime.now().date()
-_last_index_change_pct = None  # 增加：大盘风控缓存
+_dca_daily_lock: dict[str, str] = {}   # {stock_code: "YYYY-MM-DD"}
 
+def _is_dca_locked(code: str) -> bool:
+    today = datetime.now().strftime("%Y-%m-%d")
+    return _dca_daily_lock.get(code) == today
+
+def _set_dca_lock(code: str):
+    today = datetime.now().strftime("%Y-%m-%d")
+    _dca_daily_lock[code] = today
+
+# ==========================================
+# 📡 大盘缓存读取 + 陈旧计数器
+# ==========================================
+_last_index_change_pct = None
 _stale_cache_counter = 0
-_STALE_CACHE_HALT_THRESHOLD = 6
+_STALE_CACHE_HALT_THRESHOLD = 5
 
 def _get_index_change_pct_from_cache():
-    """从本地缓存文件读取大盘跌幅"""
     global _stale_cache_counter
     cache_file = os.path.join(PROJECT_ROOT, "data_cache", "index_sh000001.json")
     try:
         if os.path.exists(cache_file):
             with open(cache_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            
-            # 超过 10 分钟未更新视为 stale
-            if time.time() - data.get("ts", 0) > 600:
+                cache_data = json.load(f)
+            cache_ts = cache_data.get("timestamp", 0)
+            if time.time() - cache_ts > 600:
                 _stale_cache_counter += 1
                 logger.warning(f"[INDEX_CACHE_STALE] 大盘缓存文件超过 10 分钟未更新！连续陈旧次数: {_stale_cache_counter}，准备 fallback 到内存缓存")
                 if _stale_cache_counter >= _STALE_CACHE_HALT_THRESHOLD:
-                    logger.critical(f"[INDEX_CACHE_STALE] 连续陈旧次数达到阈值 {_STALE_CACHE_HALT_THRESHOLD}，熔断交易！")
-                    set_trading_state(TradingState.FROZEN)
+                    logger.error(f"[INDEX_CACHE_HALT] 大盘缓存连续陈旧 {_stale_cache_counter} 次，触发保守熔断！")
                 return None
-                
             _stale_cache_counter = 0
-            return float(data.get("change_pct", 0.0))
+            return cache_data.get("change_pct")
         else:
             logger.warning("[INDEX_CACHE_MISSING] 大盘缓存文件不存在，可能 index_cache_updater 未启动！")
+            return None
     except Exception as e:
-        logger.error(f"[INDEX_CACHE_ERROR] 读取大盘缓存失败: {e}")
-    return None
-
-class LRUStockHistory(OrderedDict):
-    def __init__(self, maxsize=50, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.maxsize = maxsize
-
-    def __getitem__(self, key):
-        if key not in self:
-            val = {"prices": [], "highs": [], "lows": [], "main_funds": []}
-            self[key] = val
-            return val
-        self.move_to_end(key)
-        return super().__getitem__(key)
-
-    def __setitem__(self, key, value):
-        super().__setitem__(key, value)
-        self.move_to_end(key)
-        if len(self) > self.maxsize:
-            self.popitem(last=False)
-
-    def get(self, key, default=None):
-        if key in self:
-            self.move_to_end(key)
-            return self[key]
-        return default
+        logger.error(f"[INDEX_CACHE_ERROR] 读取大盘缓存异常: {e}")
+        return None
 
 
-def run_slow_brain():
-    logger.info("=" * 70)
-    logger.info("🧠 满血慢脑节点 (Slow Brain) 已启动 - ZeroMQ 指挥官")
-    logger.info("=" * 70)
+def _calculate_portfolio_value(portfolio: dict, daily_quotes: list) -> float:
+    """计算组合总市值"""
+    cash = portfolio.get("cash", 0)
+    positions = portfolio.get("positions", {})
+    market_value = 0.0
+    
+    quotes_by_code = {q["code"]: q for q in daily_quotes if "code" in q}
+    
+    for code, pos in positions.items():
+        qty = pos.get("quantity", 0)
+        if qty <= 0:
+            continue
+        if code in quotes_by_code:
+            price = quotes_by_code[code].get("current_price", pos.get("avg_cost", 0))
+        else:
+            price = pos.get("avg_cost", 0)
+        market_value += qty * price
+    
+    return cash + market_value
 
-    # 启动 ZeroMQ 广播基站
+
+def _serialize_order(order: dict) -> dict:
+    """确保订单可 JSON 序列化"""
+    result = {}
+    for k, v in order.items():
+        if hasattr(v, 'item'):
+            result[k] = v.item()
+        elif isinstance(v, (int, float, str, bool, type(None))):
+            result[k] = v
+        else:
+            result[k] = str(v)
+    return result
+
+
+def run_brain_node():
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
-    BRAIN_NODE_PUB_ENDPOINT = "tcp://127.0.0.1:5555"
-    socket.bind(BRAIN_NODE_PUB_ENDPOINT)
-    logger.info(f"[ZMQ_BIND] source=brain_node endpoint={BRAIN_NODE_PUB_ENDPOINT}")
-
-    _stock_history = LRUStockHistory(maxsize=50)
-    _config = {
-        "max_positions": 5,
-        "sell": {"stop_loss_pct": -10.0, "take_profit_pct": 15.0},
-        "dca": {"base_amount": 10000, "interval_days": 20},
-        # 🔧 网格火力口径重塑：
-        # - trade_amount 提升至 10000 元，确保越过 6000 元免五生死线（避免最低 5 元手续费反噬）
-        # - step_pct 拉宽至 5%，降低开火频率，防止震荡市中资金被网格快速榨干
-        "grid": {"step_pct": 0.05, "trade_amount": 10000},
-    }
+    socket.bind("tcp://*:5555")
     
-    _grid_mgr = GridManager(
-        step_pct=_config["grid"]["step_pct"], 
-        trade_amount=_config["grid"]["trade_amount"]
-    )
+    logger.info("✅ ZeroMQ 广播频道已绑定 tcp://*:5555")
 
-    def send_order(action: str, code: str, shares: int, price: float, reason: str):
-        import uuid
-        # 5分钟指纹幂等性ID
-        order_id = f"{code}_{action}_{int(time.time())//60}"
-        trade_id = str(uuid.uuid4())
-        order = {
-            "order_id": order_id,
-            "trade_id": trade_id,
-            "decision_id": "",
-            "event_ids": [],
-            "source": "brain_node",
-            "action": action,
-            "code": code,
-            "shares": int(shares),
-            "signal_price": float(price),
-            "reason": str(reason),
-            "timestamp": datetime.now().isoformat()
-        }
-        socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
-        logger.info(f"📡 [广播指令] {action}: {code} | 股数: {shares} | 信号价: {price:.2f} | ID: {order_id} | 原因: {reason}")
-
-    # ================= 新增：启动时进行历史数据预热 =================
-    logger.info("⏳ 正在预热 60 日历史行情底座，构建策略路由上下文...")
+    # ===============================================================
+    # 历史数据预热（启动时一次性加载，后续增量更新）
+    # ===============================================================
+    _stock_history = {}
+    logger.info("📡 正在预热历史数据底座...")
     for code in LIVE_UNIVERSE:
         try:
-            _, hist_quotes, _ = download_historical_data(code, days=60) # 拉取 60 天
-            if hist_quotes:
-                _stock_history[code]["prices"] = [q["price"] for q in hist_quotes]
-                _stock_history[code]["highs"] = [q.get("high", q["price"]) for q in hist_quotes]
-                _stock_history[code]["lows"] = [q.get("low", q["price"]) for q in hist_quotes]
-                # 如果有资金流数据也可以在这里 append
+            hist_df, _, _ = download_historical_data(code, days=30)
+            if hist_df is not None and not hist_df.empty:
+                _stock_history[code] = hist_df
         except Exception as e:
-            logger.warning(f"预热 {code} 历史数据失败: {e}")
-        time.sleep(0.2) # 防止瞬间并发把 API 接口打挂
+            logger.warning(f"[预热] {code} 历史数据加载失败: {e}")
     logger.info(f"✅ 历史底座预热完毕，共加载 {len(_stock_history)} 只标的。")
     # ===============================================================
 
@@ -165,6 +152,22 @@ def run_slow_brain():
             continue
 
         logger.info(f"\n[{now.strftime('%H:%M:%S')}] 🧠 慢脑开始新一轮深度行情演算...")
+
+        # ==========================================
+        # 0. 获取资讯情绪因子（每轮开头执行，结果写入 data_cache）
+        # ==========================================
+        if _NEWS_AVAILABLE:
+            try:
+                _news_sentiment = get_news_sentiment(hours=24)
+                _news_cache_path = os.path.join(PROJECT_ROOT, "data_cache", "news_sentiment_cache.json")
+                _news_sentiment["_ts"] = time.time()
+                _news_sentiment["_datetime"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                os.makedirs(os.path.join(PROJECT_ROOT, "data_cache"), exist_ok=True)
+                with open(_news_cache_path, "w", encoding="utf-8") as _nf:
+                    json.dump(_news_sentiment, _nf, ensure_ascii=False, indent=2)
+                logger.info(f"[NEWS] 情绪因子已写入缓存: macro={_news_sentiment.get('macro_sentiment',0)}, source={_news_sentiment.get('_source','?')}")
+            except Exception as _news_err:
+                logger.warning(f"[NEWS] 资讯情绪获取失败，不影响主流程: {_news_err}")
 
         # 1. 加载最新资产账本
         portfolio = load_portfolio()
@@ -213,203 +216,161 @@ def run_slow_brain():
                 _, quotes, _ = download_historical_data(code, days=1)
                 return quotes
             except Exception as e:
-                logger.warning(f"[MarketData] 获取 {code} 实时行情失败: {e}")
-                return None
+                logger.warning(f"[行情拉取] {code} 失败: {e}")
+                return []
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(LIVE_UNIVERSE), 10)) as executor:
-            future_to_code = {executor.submit(fetch_one, code): code for code in LIVE_UNIVERSE}
-            for future in concurrent.futures.as_completed(future_to_code):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            futures = {executor.submit(fetch_one, code): code for code in LIVE_UNIVERSE}
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result:
+                    daily_quotes.extend(result)
+        
+        logger.info(f"📡 本轮拉取到 {len(daily_quotes)} 条行情记录")
+
+        # ==========================================
+        # 3. 交易状态校验 — Fail-close
+        # ==========================================
+        trading_state = get_trading_state()
+        if trading_state != TradingState.ACTIVE:
+            logger.warning(f"[TRADING_STATE_UNAVAILABLE] 当前交易状态: {trading_state}，禁止买入，直接进入卖出检查。")
+            # 即使状态异常，仍然允许卖出已持仓的风险标的
+            sell_signals = generate_sell_signals(portfolio, daily_quotes, _stock_history)
+            for sell_order in sell_signals:
                 try:
-                    quotes = future.result()
-                    if quotes:
-                        daily_quotes.extend(quotes)
+                    order = _serialize_order(sell_order)
+                    socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
+                    logger.info(f"[卖出广播] {sell_order.get('code')} {sell_order.get('action')} x{sell_order.get('quantity')}")
                 except Exception as e:
-                    logger.error(f"[MarketData] 并发获取失败: {e}")
-
-        if not daily_quotes:
-            logger.info("未获取到行情，休眠等待...")
+                    logger.error(f"[广播异常] 卖出信号发送失败: {e}")
             time.sleep(60)
             continue
 
-        price_map = {q["code"]: q["price"] for q in daily_quotes}
-        
-        # === 新增：将今日最新价格实时追加到历史底座中，维持 60 日滚动 ===
-        for q in daily_quotes:
-            c = q["code"]
-            if c in _stock_history:
-                _stock_history[c]["prices"].append(q["price"])
-                _stock_history[c]["highs"].append(q.get("high", q["price"]))
-                _stock_history[c]["lows"].append(q.get("low", q["price"]))
-                # 截断保持 60 天长度，节省内存
-                _stock_history[c]["prices"] = _stock_history[c]["prices"][-60:]
-                _stock_history[c]["highs"] = _stock_history[c]["highs"][-60:]
-                _stock_history[c]["lows"] = _stock_history[c]["lows"][-60:]
-        # ============================================================
-        open_price_map = {q["code"]: q.get("open", q["price"]) for q in daily_quotes}
-        high_price_map = {q["code"]: q.get("high", q["price"]) for q in daily_quotes}
-        low_price_map = {q["code"]: q.get("low", q["price"]) for q in daily_quotes}
+        # ==========================================
+        # 4. 策略引擎：选股 + 评分
+        # ==========================================
+        buy_candidates = []
+        sell_signals = []
 
-        # 3. 生成卖出信号并直接广播
-        sells = generate_sell_signals(portfolio["positions"], daily_quotes, _config)
-        for sell in sells:
-            send_order(action="SELL", code=sell["code"], shares=sell["shares"], price=sell["price"], reason=sell["reason"])
+        try:
+            buy_candidates = select_stocks(portfolio, daily_quotes, _stock_history)
+            logger.info(f"[选股] 候选买入标的: {len(buy_candidates)} 只")
+        except Exception as e:
+            logger.error(f"[选股异常] {e}")
 
-        # 4. 动态策略路由分类
-        regime_buckets = {"grid": [], "smart_dca": [], "trend": []}
-        for q in daily_quotes:
-            code = q["code"]
-            hist = _stock_history.get(code)
-            if not hist or len(hist["prices"]) < 60:
-                regime_buckets["trend"].append(q)
-                continue
-            regime = determine_market_regime(hist)
-            regime_buckets[regime].append(q)
+        try:
+            sell_signals = generate_sell_signals(portfolio, daily_quotes, _stock_history)
+            logger.info(f"[卖出信号] {len(sell_signals)} 条")
+        except Exception as e:
+            logger.error(f"[卖出异常] {e}")
 
-        # 🚨 全局系统性风险规避：清空所有买入篮子
+        # ==========================================
+        # 5. 均值回归扫描
+        # ==========================================
+        try:
+            mr_candidates = mean_reversion_scan(portfolio, daily_quotes, _stock_history)
+            if mr_candidates:
+                buy_candidates.extend(mr_candidates)
+                logger.info(f"[均值回归] 额外候选: {len(mr_candidates)} 只")
+        except Exception as e:
+            logger.warning(f"[均值回归异常] {e}")
+
+        # ==========================================
+        # 6. 网格管理
+        # ==========================================
+        grid_orders = []
+        try:
+            gm = GridManager(portfolio)
+            grid_orders = gm.generate_grid_orders(daily_quotes)
+            logger.info(f"[网格] 生成订单: {len(grid_orders)} 条")
+        except Exception as e:
+            logger.warning(f"[网格异常] {e}")
+
+        # ==========================================
+        # 7. 广播卖出信号
+        # ==========================================
+        for sell_order in sell_signals:
+            try:
+                order = _serialize_order(sell_order)
+                socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
+                logger.info(f"[卖出广播] {sell_order.get('code')} x{sell_order.get('quantity')}")
+            except Exception as e:
+                logger.error(f"[广播异常] {e}")
+
+        # ==========================================
+        # 8. 买入决策 — 系统性风险熔断拦截
+        # ==========================================
         if systemic_risk_halt:
-            regime_buckets["grid"].clear()
-            regime_buckets["smart_dca"].clear()
-            regime_buckets["trend"].clear()
-            logger.warning("🚨 [风控拦截] 已清空所有策略的买入队列。")
-
-        total_capital = portfolio.get("cash", 0.0) + sum(pos.get("shares", 0) * price_map.get(c, pos.get("avg_price", 0.0)) for c, pos in portfolio.get("positions", {}).items())
-
-        # ==========================================
-        # C2: 网格策略广播
-        # ==========================================
-        if regime_buckets["grid"] and _grid_mgr:
-            for q in regime_buckets["grid"]:
-                code = q["code"]
-                if code not in price_map: continue
-
-                if code not in _grid_mgr.grid_states:
-                    _grid_mgr.init_grid(code, open_price_map.get(code, price_map[code]))
-
-                held_shares = portfolio["positions"].get(code, {}).get("shares", 0)
-                grid_signals = _grid_mgr.check_crossings(code, high_price_map[code], low_price_map[code], held_shares)
+            logger.warning("🚨 [系统性风险] 本轮买入全部暂停，仅执行卖出。")
+        else:
+            for candidate in buy_candidates[:5]:  # 每轮最多5个买入信号
+                code = candidate.get("code", "")
                 
-                for signal in grid_signals:
-                    shares = max(100, int(_grid_mgr.trade_amount / price_map[code] / 100) * 100)
-                    if signal["action"] == "BUY":
-                        send_order(action="BUY", code=code, shares=shares, price=signal["price"], reason=f"网格买入 (L{signal['grid_level']})")
-                    elif signal["action"] == "SELL" and held_shares >= shares:
-                        send_order(action="SELL", code=code, shares=shares, price=signal["price"], reason=f"网格卖出 (L{signal['grid_level']})")
-
-        # ==========================================
-        # C3: 智能定投广播 (已注入利润垫核算)
-        # ==========================================
-        # 🔒 跨日检测：如果日期变化，清空 DCA 冷却锁
-        global _dca_traded_today, _last_dca_date
-        today = datetime.now().date()
-        if today != _last_dca_date:
-            _dca_traded_today.clear()
-            _last_dca_date = today
-            logger.info("🔒 [DCA冷却锁] 跨日重置，已清空今日定投记录")
-
-        if regime_buckets["smart_dca"]:
-            base_amount = _config["dca"]["base_amount"]
-            for q in regime_buckets["smart_dca"]:
-                code = q["code"]
-                price = price_map.get(code, 0)
-                if price <= 0: continue
-
-                # 🔒 DCA 日内冷却锁：同一标的每天只允许定投一次
-                if code in _dca_traded_today:
-                    logger.debug(f"🔒 [DCA冷却锁] {code} 今日已定投，跳过")
+                # DCA 日内冷却
+                if _is_dca_locked(code):
+                    logger.info(f"[DCA_LOCK] {code} 今日已触发过定投，跳过。")
                     continue
 
-                hist = _stock_history.get(code)
-                ma60 = sum(hist["prices"][-60:]) / 60 if hist and len(hist["prices"]) >= 60 else 0
-                atr = calculate_atr({"highs": hist["highs"], "lows": hist["lows"], "closes": hist["prices"]}, 14) if hist and len(hist["prices"]) >= 15 else 0
-
-                multiplier = calculate_dca_multiplier({"price": price, "ma60": ma60}, q.get("score", 70))
-                if multiplier <= 0: continue
-
-                if atr > 0:
-                    # 提取该股的现有持仓数据，计算浮盈比例
-                    existing_pos = portfolio["positions"].get(code, {})
-                    avg_price = existing_pos.get("avg_price", 0)
-                    floating_profit = (price - avg_price) / avg_price if avg_price > 0 else 0.0
-
-                    shares = calculate_position_size(
-                        total_capital=total_capital,
-                        current_price=price,
-                        atr=atr,
-                        risk_per_trade=0.01,
-                        max_position_pct=0.20,
-                        floating_profit_pct=floating_profit # 注入浮盈参数
+                try:
+                    atr = calculate_atr(_stock_history.get(code))
+                    position_size = calculate_position_size(
+                        portfolio.get("cash", 0),
+                        candidate.get("price", 0),
+                        atr,
+                        risk_pct=0.01
                     )
-                    shares = max(100, int(shares * multiplier / 100) * 100)
-                else:
-                    shares = max(100, int(base_amount * multiplier / price / 100) * 100)
+                    
+                    if position_size <= 0:
+                        continue
 
-                send_order(action="BUY", code=code, shares=shares, price=price, reason=f"Smart DCA (乘数{multiplier})")
+                    # 定投乘数
+                    dca_multiplier = calculate_dca_multiplier(candidate, portfolio)
+                    final_qty = int(position_size * dca_multiplier / 100) * 100  # 取整到百股
+                    
+                    if final_qty <= 0:
+                        continue
 
-                # 🔒 记录已定投标的，防止日内重复
-                _dca_traded_today.add(code)
-                logger.info(f"🔒 [DCA冷却锁] {code} 已加入今日定投黑名单，当前黑名单: {len(_dca_traded_today)} 只")
+                    order = {
+                        "code": code,
+                        "action": "BUY",
+                        "quantity": final_qty,
+                        "price": candidate.get("price", 0),
+                        "reason": candidate.get("reason", "AI信号"),
+                        "timestamp": now.isoformat()
+                    }
+                    
+                    order = _serialize_order(order)
+                    socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
+                    logger.info(f"[买入广播] {code} x{final_qty} @ {order['price']:.2f}")
+                    
+                    if candidate.get("strategy") == "dca":
+                        _set_dca_lock(code)
+                        
+                except Exception as e:
+                    logger.error(f"[买入异常] {code}: {e}")
 
         # ==========================================
-        # C4: 趋势策略 & 左侧抄底广播 (已注入利润垫核算)
+        # 9. 网格订单广播
         # ==========================================
-        if regime_buckets["trend"]:
-            trend_quotes = regime_buckets["trend"]
-            
-            # 右侧趋势
-            decisions = select_stocks(trend_quotes, portfolio["positions"], _config, mode="live")
-            for buy in decisions.get("buys", []):
-                code, price = buy["code"], buy["price"]
-                hist = _stock_history.get(code)
-                atr = calculate_atr({"highs": hist["highs"], "lows": hist["lows"], "closes": hist["prices"]}, 14) if hist and len(hist["prices"]) >= 15 else 0
-                
-                # 提取该股的现有持仓数据，计算浮盈比例
-                existing_pos = portfolio["positions"].get(code, {})
-                avg_price = existing_pos.get("avg_price", 0)
-                floating_profit = (price - avg_price) / avg_price if avg_price > 0 else 0.0
+        for grid_order in grid_orders:
+            try:
+                order = _serialize_order(grid_order)
+                socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
+            except Exception as e:
+                logger.error(f"[网格广播异常] {e}")
 
-                if atr > 0:
-                    shares = calculate_position_size(
-                        total_capital=total_capital, 
-                        current_price=price, 
-                        atr=atr, 
-                        risk_per_trade=0.01, 
-                        max_position_pct=0.20,
-                        floating_profit_pct=floating_profit # 注入浮盈参数
-                    )
-                else:
-                    shares = buy["shares"]
-
-                if shares >= 100:
-                    send_order(action="BUY", code=code, shares=shares, price=price, reason=f"{buy.get('reason', '')} | ATR={atr:.2f}")
-
-            # 左侧均值回归
-            mr_candidates = mean_reversion_scan(trend_quotes, _config, min_score=75)
-            for mr in mr_candidates:
-                if mr.stock_code in portfolio["positions"]: continue # 抄底股通常无底仓，直接continue了
-                price = price_map.get(mr.stock_code, 0)
-                if price <= 0: continue
-
-                hist = _stock_history.get(mr.stock_code)
-                atr = calculate_atr({"highs": hist["highs"], "lows": hist["lows"], "closes": hist["prices"]}, 14) if hist and len(hist["prices"]) >= 15 else 0
-                
-                # 抄底时因为没有底仓，floating_profit_pct 默认为 0.0
-                if atr > 0:
-                    shares = calculate_position_size(
-                        total_capital=total_capital, 
-                        current_price=price, 
-                        atr=atr, 
-                        risk_per_trade=0.01, 
-                        max_position_pct=0.20,
-                        floating_profit_pct=0.0 
-                    )
-                else:
-                    shares = int(total_capital * 0.10 / price / 100) * 100
-                
-                if shares >= 100:
-                    send_order(action="BUY", code=mr.stock_code, shares=shares, price=price, reason=f"{mr.buy_reason} | ATR={atr:.2f}")
+        # ==========================================
+        # 10. 市场模式判断（用于日志监控）
+        # ==========================================
+        try:
+            regime = determine_market_regime(daily_quotes, _stock_history)
+            logger.info(f"[市场模式] {regime}")
+        except Exception as e:
+            logger.warning(f"[市场模式异常] {e}")
 
         logger.info(f"🧠 本轮演算及广播完毕，休眠 60 秒等待下个切片...")
         time.sleep(60)
 
+
 if __name__ == "__main__":
-    run_slow_brain()
+    run_brain_node()
