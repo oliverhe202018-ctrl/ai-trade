@@ -69,7 +69,7 @@ def _get_index_change_pct_from_cache():
         if os.path.exists(cache_file):
             with open(cache_file, "r", encoding="utf-8") as f:
                 cache_data = json.load(f)
-            cache_ts = cache_data.get("timestamp", 0)
+            cache_ts = cache_data.get("timestamp", cache_data.get("ts", 0))
             if time.time() - cache_ts > 600:
                 _stale_cache_counter += 1
                 logger.warning(f"[INDEX_CACHE_STALE] 大盘缓存文件超过 10 分钟未更新！连续陈旧次数: {_stale_cache_counter}，准备 fallback 到内存缓存")
