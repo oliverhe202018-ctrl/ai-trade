@@ -63,7 +63,7 @@ def _get_market_filter():
     global _market_filter
     if _market_filter is None:
         try:
-            from market_filter import MarketEnvironmentFilter
+            from core.market_filter import MarketEnvironmentFilter
             _market_filter = MarketEnvironmentFilter()
         except Exception as e:
             logger.exception(f"[WARN] 大盘环境锁加载失败: {e}，将跳过环境检测")
@@ -253,7 +253,7 @@ def mean_reversion_scan(quotes, config, min_score=None):
         list of MeanReversionScore objects
     """
     try:
-        from mean_reversion_scanner import MeanReversionScanner
+        from core.mean_reversion_scanner import MeanReversionScanner
         scanner = MeanReversionScanner()
         if min_score is not None:
             scanner.MIN_SCORE = min_score

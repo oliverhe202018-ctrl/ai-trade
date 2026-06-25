@@ -33,10 +33,10 @@ def get_morning_telegraph():
     ─────────────────────────────────────────────────────────
     """
     try:
-        df = ak.stock_zh_a_telegraph()
-        # 取最近的 5 条重磅电报（列名以实际返回为准，若报错请执行上面第 2 步确认列名）
-        content_col = '内容' if '内容' in df.columns else df.columns[1]
-        recent_news = df.head(5)[content_col].tolist()
+        df = ak.stock_info_global_em()
+        # 取最近的 5 条重磅电报（列名以实际返回为准）
+        content_col = '标题' if '标题' in df.columns else ('内容' if '内容' in df.columns else df.columns[1])
+        recent_news = df.head(5)[content_col].astype(str).tolist()
         return " | ".join(recent_news)
     except Exception as e:
         logger.error(f"电报获取失败: {e}")
