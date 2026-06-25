@@ -7,6 +7,8 @@ import subprocess
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(PROJECT_ROOT)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 def _read_json(path):
     if not os.path.exists(path):
@@ -131,46 +133,19 @@ def generate_72h_status_report(market_health, news_health, total_events, recent_
         f.write(report_content)
 
 def generate_paper_trading_report():
+    """使用 PaperPerformanceAnalyzer 生成真实模拟盘绩效报告，替换硬编码空壳。"""
+    from core.paper_performance_analyzer import PaperPerformanceAnalyzer
+
+    analyzer = PaperPerformanceAnalyzer()
+    stats = analyzer.analyze(window_hours=72)
+
+    # 输出新格式报告（详细绩效）
+    perf_md_path = os.path.join(PROJECT_ROOT, "reports", "paper_trading_performance.md")
+    analyzer.write_markdown_report(stats, path=perf_md_path)
+
+    # 保持旧路径兼容
     report_path = os.path.join(PROJECT_ROOT, "reports", "paper_trading_observation.md")
-    report_content = """# 行情模拟盘 72 小时观察报告
-
-## 1. 运行周期
-开始：2026-06-25
-
-## 2. 行情健康度统计
-- OK 次数：0
-- STALE 次数：0
-- DOWN 次数：0
-- 最大 delay_seconds：0
-- 平均 delay_seconds：0
-
-## 3. Brain 信号统计
-- 总扫描次数：0
-- BUY 信号次数：0
-- HOLD / NO_TRADE 次数：0
-- 因行情异常禁 BUY 次数：0
-- 因 K 线不足禁 BUY 次数：0
-
-## 4. Trader 行为统计
-- 模拟订单数：0
-- 模拟 TWAP 任务数：0
-- 因行情 STALE 拒绝订单次数：0
-- 因行情 DOWN 拒绝订单次数：0
-- 因流动性不足拒绝订单次数：0
-- FROZEN 次数：0
-
-## 5. 看门狗与心跳
-- Brain 心跳是否连续：是
-- Trader 心跳是否连续：是
-- 是否发生看门狗重启：否
-- 是否发生假死：否
-- 是否发生异常退出：否
-
-## 6. 结论
-- RUNNING，继续模拟盘
-"""
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write(report_content)
+    analyzer.write_markdown_report(stats, path=report_path)
 
 def generate_news_readonly_report():
     report_path = os.path.join(PROJECT_ROOT, "reports", "news_readonly_observation.md")
