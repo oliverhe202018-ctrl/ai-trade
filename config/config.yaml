@@ -1,12 +1,33 @@
-broker:
-  account_id: '8881541669'
-  client_path: D:\国金证券QMT交易端\userdata_mini
-  type: qmt
 broker_mode: mock
+initial_capital: 50000
 daily_profit_target: 50
 data_source: tencent
-easytrader_path: auto
-initial_capital: 50000
+strategy:
+  exclude_sectors: []
+  max_per_sector: 2
+  max_positions: 10
+  max_sector_pct: 30
+  max_single_pct: 25
+  min_buy_amount: 2000
+  position_sizing: atr
+  safe_gain_range:
+  - -3
+  - 3
+  type: trend
+risk:
+  circuit_breaker: true
+  max_daily_drawdown: -3
+  max_holding_days: 20
+  max_total_loss_pct: -10
+  stop_loss_pct: -8
+  take_profit_pct: 10
+simulation:
+  commission_rate: 0.00025
+  min_commission: 5
+  slippage_pct: 0.1
+  stamp_tax_rate: 0.001
+  transfer_fee_rate: 1.0e-05
+  use_realtime: true
 live:
   commission_rate: 0.00025
   max_order_count: 10
@@ -18,6 +39,9 @@ live:
   slippage: 0.01
   stamp_tax_rate: 0.001
   transfer_fee_rate: 1.0e-05
+qmt:
+  account_id: ''
+  mini_qmt_path: ''
 llama:
   models:
     qwen_normal:
@@ -33,6 +57,17 @@ llama:
       n_gpu_layers: 32
       n_ubatch: 512
   server_path: ''
+easytrader_path: auto
+tdx_path: auto
+notify:
+  chat_id: ''
+  telegram_token: ''
+  webhook: ''
+poll_interval: 300
+broker:
+  account_id: '8881541669'
+  client_path: D:\国金证券QMT交易端\userdata_mini
+  type: qmt
 market_data:
   allow_fallback_for_research_only: false
   freeze_on_stale_data: true
@@ -56,38 +91,8 @@ news_data:
   store:
     path: data_cache/news_events.db
     type: sqlite
-notify:
-  chat_id: ''
-  telegram_token: ''
-  webhook: ''
-poll_interval: 300
-qmt:
-  account_id: ''
-  mini_qmt_path: ''
-risk:
-  circuit_breaker: true
-  max_daily_drawdown: -3
-  max_holding_days: 20
-  max_total_loss_pct: -10
-  stop_loss_pct: -8
-  take_profit_pct: 10
-simulation:
-  commission_rate: 0.00025
-  min_commission: 5
-  slippage_pct: 0.1
-  stamp_tax_rate: 0.001
-  transfer_fee_rate: 1.0e-05
-  use_realtime: true
-strategy:
-  exclude_sectors: []
-  max_per_sector: 2
-  max_positions: 10
-  max_sector_pct: 30
+hyperparams:
+  atr_period: 14
+  risk_per_trade: 0.008
+  stop_loss_pct: -0.05
   max_single_pct: 25
-  min_buy_amount: 2000
-  position_sizing: atr
-  safe_gain_range:
-  - -3
-  - 3
-  type: trend
-tdx_path: auto

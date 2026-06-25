@@ -1,22 +1,33 @@
 """
-核心风控模块 (Risk Manager)
+核心风控模块 (Risk Manager) — v2 统一配置源
 包含：动态 ATR 止损映射、凯利公式利润垫加仓、持仓熔断逻辑
+
+配置源变更：
+  v1: 从 config/hyperparams.json 独立读取（已废弃）
+  v2: 通过 broker.load_config() 从 config/config.yaml → hyperparams 节读取
 """
-import os
-import json
 from core.logger_config import logger
 
+
 def _load_hyperparams():
-    """加载固化的静态超参数配置"""
-    # 路径适配新的工程目录结构
-    config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'hyperparams.json')
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"[风控层] hyperparams.json 解析失败: {e}")
-    return {}
+    """
+    加载统一超参数配置（来自 config.yaml → hyperparams 节）。
+    
+    替代原 hyperparams.json 的独立读取逻辑。默认值与 auto_tuner 内置默认值对齐：
+      atr_period=14, risk_per_trade=0.008, stop_loss_pct=-0.05, max_single_pct=25
+    """
+    try:
+        from core.broker import load_config
+        config = load_config()
+        return config.get("hyperparams", {})
+    except Exception as e:
+        logger.error(f"[风控层] 统一配置加载失败 (fallback to defaults): {e}")
+        return {
+            "atr_period": 14,
+            "risk_per_trade": 0.008,
+            "stop_loss_pct": -0.05,
+            "max_single_pct": 25,
+        }
 
 def calculate_atr(data, period=20):
     """计算真实波动幅度 (ATR)"""

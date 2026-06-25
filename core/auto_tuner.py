@@ -1,6 +1,10 @@
 """
-大模型自闭环调优引擎 (Auto Tuner)
+大模型自闭环调优引擎 (Auto Tuner) — v2 统一配置源
 基于每日报告，调用本地大模型进行参数反思与动态调整
+
+配置源变更：
+  v1: 独立读写 config/hyperparams.json（已废弃）
+  v2: 通过 broker.load_config() / broker.save_config() 读写 config.yaml → hyperparams 节
 """
 import json
 import os
@@ -10,13 +14,13 @@ from datetime import datetime
 
 from core.logger_config import logger
 
-# 路径常量
+# 对等默认值（与 config.yaml 中 hyperparams 节的默认值一致）
 CACHE_DIR = "data_cache"
-HYPERPARAMS_PATH = os.path.join("config", "hyperparams.json")
 DEFAULT_HYPERPARAMS = {
     "atr_period": 14,
-    "risk_per_trade": 0.01,
+    "risk_per_trade": 0.008,
     "stop_loss_pct": -0.05,
+    "max_single_pct": 25,
 }
 
 # 本地大模型 API 地址
@@ -42,25 +46,47 @@ JSON 模板样例：
 
 
 def _load_hyperparams():
-    """加载当前超参数，文件不存在时返回默认值"""
-    if not os.path.exists(HYPERPARAMS_PATH):
-        return dict(DEFAULT_HYPERPARAMS)
+    """加载统一超参数配置（来自 config.yaml → hyperparams 节）"""
     try:
-        with open(HYPERPARAMS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
+        from core.broker import load_config
+        config = load_config()
+        hp = config.get("hyperparams", {})
+        # 确保所有键存在，缺失键用默认值填充
+        result = dict(DEFAULT_HYPERPARAMS)
+        result.update(hp)
+        return result
+    except Exception as e:
+        logger.warning(f"[调优引擎] 统一配置加载失败，使用默认值: {e}")
         return dict(DEFAULT_HYPERPARAMS)
 
 
 def _save_hyperparams(params):
-    """原子化保存超参数到 JSON 文件"""
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    temp_path = HYPERPARAMS_PATH + ".tmp"
-    with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(params, f, indent=2, ensure_ascii=False)
-    # 原子替换
-    os.replace(temp_path, HYPERPARAMS_PATH)
-    logger.info(f"[调优引擎] 参数已更新: {params}")
+    """
+    原子化保存超参数到 config.yaml → hyperparams 节（共享配置）。
+    
+    使用 broker.save_config() 方法，与 broker.py / risk_manager.py 共享同一配置源。
+    """
+    try:
+        from core.broker import load_config, save_config
+        config = load_config()
+        config["hyperparams"] = params
+        save_config(config)
+        logger.info(f"[调优引擎] 参数已更新到统一配置: {params}")
+    except Exception as e:
+        logger.exception(f"[调优引擎] 统一配置保存失败: {e}，尝试旧式 json 落盘兜底")
+        _save_hyperparams_fallback(params)
+
+
+def _save_hyperparams_fallback(params):
+    """兜底：保存超参数到 data_cache/hyperparams_fallback.json（当 save_config 不可用时）"""
+    try:
+        fallback_path = os.path.join(CACHE_DIR, "hyperparams_fallback.json")
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(fallback_path, "w", encoding="utf-8") as f:
+            json.dump(params, f, indent=2, ensure_ascii=False)
+        logger.info(f"[调优引擎] 参数已落盘到降级路径: {fallback_path}")
+    except Exception as e2:
+        logger.exception(f"[调优引擎] 降级落盘也失败: {e2}")
 
 
 def run_daily_reflection(report_path):

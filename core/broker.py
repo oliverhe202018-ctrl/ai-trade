@@ -128,6 +128,25 @@ def load_config():
         return DEFAULT_CONFIG.copy()
 
 
+def save_config(config: dict):
+    """
+    原子化保存配置到 config/config.yaml。
+    
+    这是统一配置写入入口 —— auto_tuner.py / update_config.py 等模块通过此函数
+    写入配置，确保与 load_config() 的读取路径完全一致，消除"双配置源"问题。
+    """
+    try:
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        tmp_file = CONFIG_FILE + ".tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        os.replace(tmp_file, CONFIG_FILE)
+        logger.info(f"[配置] 配置已原子化保存: {CONFIG_FILE}")
+    except Exception as e:
+        logger.exception(f"[错误] 保存配置文件失败: {CONFIG_FILE}")
+        raise
+
+
 def detect_easytrader_path():
     """自动检测同花顺客户端路径"""
     candidates = [

@@ -395,7 +395,15 @@ def sync_portfolio():
         return False
 
 
-# ─── ZeroMQ 战术总线窃听引擎 ─────────────────────────────────
+@st.cache_resource
+def start_radar_service():
+    """ 启动多因子异动雷达后台线程 """
+    try:
+        from core.radar_manager import start_radar_daemon
+        start_radar_daemon()
+    except Exception as e:
+        logger.error(f"启动雷达服务失败: {e}")
+    return True
 
 @st.cache_resource
 def start_zmq_telemetry():
@@ -1893,6 +1901,277 @@ def module_observation_reports():
             else:
                 st.warning(f"报告文件未生成: {path}")
 
+def module_copilot():
+    st.header("🤖 AI 股票助手 (Copilot)")
+    st.markdown("通过自然语言与系统对话，直接分析持仓、个股、新闻与交易信号。")
+    
+    # 状态初始化
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+        
+    col_clear, _ = st.columns([1, 5])
+    with col_clear:
+        if st.button("🧹 清空会话", type="secondary"):
+            st.session_state.chat_history = []
+            st.rerun()
+            
+    st.markdown("---")
+    
+    # 聊天区域
+    for message in st.session_state.chat_history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            
+    # 输入区域
+    if prompt := st.chat_input("您可以问：今天有哪些机会？分析贵州茅台？当前持仓风险如何？为什么没有下单？"):
+        st.session_state.chat_history.append({"role": "user", "content": prompt})
+        
+        with st.chat_message("user"):
+            st.markdown(prompt)
+            
+        with st.chat_message("assistant"):
+            with st.spinner("🧠 大脑中枢演算中..."):
+                try:
+                    from core.copilot_service import chat_with_copilot
+                    
+                    app_state = {}
+                    # 从全局抓取 ZMQ telemetry data
+                    try:
+                        start_radar_service()
+                        order_q, _ = start_zmq_telemetry()
+                        app_state["order_queue"] = list(order_q)
+                    except Exception:
+                        pass
+                        
+                    res = chat_with_copilot(prompt, st.session_state.chat_history, app_state)
+                    
+                    answer = res["answer"]
+                    intent = res["intent"]
+                    latency = res["latency"]
+                    
+                    st.markdown(answer)
+                    st.caption(f"⏱️ 耗时: {latency}ms | 🎯 识别意图: {intent}")
+                    
+                    st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                except Exception as e:
+                    st.error(f"调用助手服务失败: {e}")
+
+def module_potential_discovery():
+    st.header("🌟 潜力股发现 (Potential Discovery)")
+    st.markdown("漏斗式人工智能深度研判引擎。从全市场 Top 100 中结合规则与多因子异动分数选出 Top 10，并提交大模型进行最后评估。*(仅供分析观察，绝不提供买卖建议)*")
+    
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("🧠 立即启动深度挖掘引擎", type="primary"):
+            from core.potential_discovery import run_discovery_async, _discovery_lock
+            if _discovery_lock.locked():
+                st.warning("⚠️ 引擎正在后台进行深度思辨，请勿重复点击。")
+            else:
+                success = run_discovery_async()
+                if success:
+                    st.success("✅ 挖掘任务已启动 (LLM 分析大概需要 10-20 秒)，请稍后刷新查看。")
+                else:
+                    st.warning("⚠️ 并发拦截。")
+            time.sleep(1)
+            st.rerun()
+            
+    with col2:
+        from core.potential_discovery import _discovery_lock
+        if _discovery_lock.locked():
+            st.info("🔄 **运行状态**: 大脑中枢演算中...请稍后刷新。")
+        else:
+            st.info("💡 提示：本引擎强依赖于【🔥 全市场扫描】的输出。如果发现数据陈旧，请先执行全市场扫描。")
+            
+    st.markdown("---")
+    
+    picks_file = os.path.join(CACHE_DIR, "potential_picks.json")
+    if os.path.exists(picks_file):
+        try:
+            with open(picks_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                
+            updated = data.get("updated_at", "未知")
+            picks = data.get("picks", [])
+            
+            st.caption(f"🕒 报告生成时间: {updated} | 🏆 最终入选标的: {len(picks)} 只")
+            
+            if picks:
+                for idx, p in enumerate(picks):
+                    with st.expander(f"✨ Top {idx+1}: {p.get('name', 'Unknown')} ({p.get('code', '')}) - 优先级: {p.get('watch_priority', 'Medium')}", expanded=(idx==0)):
+                        col_score1, col_score2, col_score3 = st.columns(3)
+                        col_score1.metric("Scanner 分数", p.get('scanner_score', 0))
+                        col_score2.metric("Fusion 分数", p.get('fusion_score', 0))
+                        col_score3.metric("AI 潜力分数", p.get('potential_score', 0))
+                        
+                        st.markdown(f"**🧠 深度研判**: {p.get('reason', '无分析理由')}")
+                        
+                        tags = p.get('risk_tags', [])
+                        if tags:
+                            tag_str = " ".join([f"`{t}`" for t in tags])
+                            st.markdown(f"**⚠️ 风险标签**: {tag_str}")
+            else:
+                st.warning("大模型在本轮研判中认为没有值得追踪的标的。")
+                
+        except Exception as e:
+            st.error(f"解析挖掘报告失败: {e}")
+    else:
+        st.info("尚未生成潜力股报告，请点击上方按钮启动挖掘。")
+
+def module_tape_reader():
+    st.header("💰 主力资金追踪 (Tape Reader V1)")
+    st.markdown("基于 L1 快照降维推演的主力行为捕捉器。本系统仅追踪 **Top 30** 潜力标的，估算主动买卖意愿及疑似大单净流入。*(仅供观察，非绝对 L2 精准数据)*")
+    
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        from core.tape_reader import _tape_lock, _stop_event, start_tape_reader_async, stop_tape_reader
+        
+        is_locked = _tape_lock.locked()
+        is_stopping = is_locked and _stop_event.is_set()
+        is_running = is_locked and not _stop_event.is_set()
+        
+        if is_running:
+            if st.button("⏹️ 停止实时追踪", type="secondary"):
+                stop_tape_reader()
+                time.sleep(0.5)
+                st.rerun()
+        elif is_stopping:
+            st.button("⏹️ 正在停止...", disabled=True)
+        else:
+            if st.button("▶️ 启动盘口追踪", type="primary"):
+                success = start_tape_reader_async()
+                if success:
+                    st.success("✅ 后台轮询引擎已启动。")
+                time.sleep(0.5)
+                st.rerun()
+                
+    with col2:
+        if is_running:
+            st.info("🔄 **运行状态**: 后台循环捕获中 (3秒/次)... 可通过右上角 ⋮ 设置自动刷新。")
+        elif is_stopping:
+            st.warning("⏳ **运行状态**: 正在安全退出，等待最后一次写入完成并释放锁...")
+        else:
+            st.info("💡 提示：此引擎长期运行可能会轻微占用 CPU。只建议在盘中开启，盘后自动失效。")
+
+    st.markdown("---")
+    
+    tracking_file = os.path.join(CACHE_DIR, "main_money_tracking.json")
+    if os.path.exists(tracking_file):
+        try:
+            with open(tracking_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                
+            updated = data.get("timestamp", 0)
+            items = data.get("items", [])
+            st.caption(f"🕒 数据快照时间: {datetime.fromtimestamp(updated).strftime('%H:%M:%S')} | 数据等级: {data.get('data_level', 'Unknown')}")
+            
+            if items:
+                # 构造 DataFrame 以便漂亮地展示
+                df_data = []
+                for idx, it in enumerate(items):
+                    df_data.append({
+                        "排名": idx + 1,
+                        "名称": it.get("name", ""),
+                        "代码": it.get("code", ""),
+                        "当前价": it.get("last_price", 0),
+                        "代理分(Proxy)": it.get("main_money_proxy_score", 0),
+                        "大单净流入(估)": it.get("estimated_large_order_net_inflow", 0),
+                        "大单频次": it.get("large_order_event_count", 0),
+                        "盘口失衡(委比)": it.get("order_book_imbalance", 0.0),
+                        "快照样本数": it.get("sample_count", 0)
+                    })
+                import pandas as pd
+                df = pd.DataFrame(df_data)
+                
+                st.dataframe(
+                    df,
+                    column_config={
+                        "大单净流入(估)": st.column_config.NumberColumn(format="%.0f"),
+                        "盘口失衡(委比)": st.column_config.NumberColumn(format="%.3f"),
+                        "代理分(Proxy)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d")
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+                st.warning("⚠️ **风险提示**: 本页所有主动买卖与大单流入指标，均由 3 秒级的 L1 Snapshot 聚合模拟产生，不等同于交易所真实的 L2 逐笔明细，仅供模糊资金定性分析参考。")
+            else:
+                st.warning("跟踪列表为空，可能 Top30 标的均处于停牌或未产生成交差值。")
+        except Exception as e:
+            st.error(f"解析追踪文件失败: {e}")
+    else:
+        st.info("尚未生成主力资金追踪数据。请先启动追踪器并等待数秒。")
+
+def module_market_scanner():
+    st.header("🔥 全市场扫描 (Market Scanner)")
+    st.markdown("通过多维度量化指标对沪深A股 5000+ 标的进行全景扫描，发现潜在交易机会。*(纯规则驱动，无 LLM 介入)*")
+    
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("🚀 立即执行全市场扫描", type="primary"):
+            from core.market_scanner import run_scanner_async, _scan_lock
+            if _scan_lock.locked():
+                st.warning("⚠️ 扫描引擎正在后台运行，请勿重复点击。")
+            else:
+                success = run_scanner_async()
+                if success:
+                    st.success("✅ 扫描引擎已在后台启动，请稍后刷新页面查看结果。")
+                else:
+                    st.warning("⚠️ 扫描任务并发拦截。")
+            time.sleep(1)
+            st.rerun()
+            
+    with col2:
+        from core.market_scanner import _scan_lock
+        if _scan_lock.locked():
+            st.info("🔄 **运行状态**: 扫描中...请稍后刷新。")
+        else:
+            st.info("💡 提示：静态日线指标（均线、新高）每天仅计算一次以加速盘中扫描。增量更新实时价格与量能。")
+        
+    st.markdown("---")
+    
+    candidates_file = os.path.join(CACHE_DIR, "market_candidates.json")
+    if os.path.exists(candidates_file):
+        try:
+            with open(candidates_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                
+            ts = data.get("timestamp", 0)
+            cost = data.get("cost_ms", 0)
+            candidates = data.get("candidates", [])
+            
+            from datetime import datetime
+            time_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            
+            st.caption(f"🕒 最后扫描时间: {time_str} | ⏱️ 耗时: {cost} ms | 📊 入库标的: {len(candidates)} 只")
+            
+            if candidates:
+                # 转换为 DataFrame 展示
+                df = pd.DataFrame(candidates)
+                # 展开 factors 列表为字符串
+                df['factors'] = df['factors'].apply(lambda x: " | ".join(x) if isinstance(x, list) else x)
+                df.rename(columns={"code": "代码", "name": "名称", "score": "综合得分", "factors": "驱动因子"}, inplace=True)
+                
+                st.dataframe(
+                    df,
+                    column_config={
+                        "综合得分": st.column_config.ProgressColumn(
+                            "综合得分",
+                            help="基于涨跌幅、量能、趋势和消息面的多因子得分",
+                            format="%.1f",
+                            min_value=0,
+                            max_value=100,
+                        ),
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+            else:
+                st.warning("暂无符合条件的高分标的。")
+                
+        except Exception as e:
+            st.error(f"解析扫描结果失败: {e}")
+    else:
+        st.info("暂未发现扫描结果，请点击上方按钮执行首次扫描。")
+
 def main():
     """主入口"""
     st.title("🚀 AI Trader 量化系统控制台")
@@ -1901,7 +2180,7 @@ def main():
     st.sidebar.title("导航菜单")
     selected_module = st.sidebar.radio(
         "选择模块",
-        ["📊 资产监控大屏", "📰 资讯情绪中枢", "📈 Paper Trading 监控", "📋 自选股管理", "📜 系统运行日志", "📜 历史复盘", "👀 72小时观察报告"],
+        ["🔥 全市场扫描", "🌟 潜力股发现", "💰 主力资金追踪", "🤖 AI股票助手", "📊 资产监控大屏", "📰 资讯情绪中枢", "📈 Paper Trading 监控", "📋 自选股管理", "📜 系统运行日志", "📜 历史复盘", "👀 72小时观察报告"],
         index=0
     )
 
@@ -1918,7 +2197,15 @@ def main():
     )
 
     # 根据选择显示对应模块
-    if selected_module == "📊 资产监控大屏":
+    if selected_module == "🔥 全市场扫描":
+        module_market_scanner()
+    elif selected_module == "🌟 潜力股发现":
+        module_potential_discovery()
+    elif selected_module == "💰 主力资金追踪":
+        module_tape_reader()
+    elif selected_module == "🤖 AI股票助手":
+        module_copilot()
+    elif selected_module == "📊 资产监控大屏":
         module_portfolio_dashboard()
     elif selected_module == "📰 资讯情绪中枢":
         module_news_sentiment()

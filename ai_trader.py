@@ -179,8 +179,7 @@ class MarketDataError(Exception):
 
 def final_risk_gate(symbol, action, market_data, events=None, portfolio=None, decision_id=None):
     from core.trading_state import get_trading_state, TradingState
-    from core.risk_manager import _load_hyperparams
-    
+
     def _block(reason):
         logger.warning(f"[RISK_GATE_BLOCK] [{symbol}] {reason}")
         if decision_id:
@@ -236,9 +235,12 @@ def final_risk_gate(symbol, action, market_data, events=None, portfolio=None, de
         logger.error(f"[RISK_GATE_BLOCK] [TRADING_STATE_UNAVAILABLE] Failed to get trading state: {e}")
         return _block("Trading state unavailable")
         
-    params = _load_hyperparams()
-    max_position_pct = params.get('max_single_pct', 0.15)
-    max_daily_loss = params.get('stop_loss_pct', -0.08)
+    # 统一通过 load_config() 读取超参数（替代旧式 hyperparams.json 独立读取）
+    from core.broker import load_config
+    config = load_config()
+    hp = config.get("hyperparams", {})
+    max_position_pct = hp.get('max_single_pct', 25) / 100.0
+    max_daily_loss = hp.get('stop_loss_pct', -0.08)
     
     cash = portfolio.get('cash', 0.0)
     positions = portfolio.get('positions', {})
