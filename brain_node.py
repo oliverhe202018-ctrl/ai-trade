@@ -193,9 +193,9 @@ def run_brain_node():
             else:
                 # 缓存为空或超过5分钟，fallback 到内存缓存
                 if _last_index_change_pct is None:
-                    # 内存缓存也为空，默认进入保守模式 (-999.0)
-                    logger.warning("[INDEX_CACHE_MISSING] 大盘缓存与内存缓存均为空，默认进入保守模式！")
-                    _last_index_change_pct = -999.0
+                    # 内存缓存也为空，默认进入中性模式 (0.0)，防止误触发熔断
+                    logger.warning("[INDEX_CACHE_MISSING] 大盘缓存与内存缓存均为空，默认进入中性模式，不触发熔断！")
+                    _last_index_change_pct = 0.0
                     
             if _last_index_change_pct <= -2.5:
                 systemic_risk_halt = True
