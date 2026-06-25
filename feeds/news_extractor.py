@@ -45,29 +45,24 @@ def fetch_layer1_em_akshare(hours=24):
         columns = list(news_df.columns)
         KNOWN_COLUMNS = {
             "time": ["发布时间", "时间", "publish_time"], 
-            "content": ["摘要", "内容", "标题", "title"]
+            "content": ["摘要", "内容", "news_content", "标题", "title"],
+            "title": ["标题", "title"]
         }
         
-        time_col = None
-        for col in columns:
-            if any(k in col.lower() for k in KNOWN_COLUMNS["time"]):
-                time_col = col
-                break
-                
-        content_col = None
-        for col in columns:
-            if any(k in col.lower() for k in KNOWN_COLUMNS["content"]):
-                content_col = col
-                break
-                
-        if not time_col or not content_col:
+        time_col = next((c for c in columns if any(k in c.lower() for k in KNOWN_COLUMNS["time"])), None)
+        title_col = next((c for c in columns if any(k in c.lower() for k in KNOWN_COLUMNS["title"])), None)
+        content_col = next((c for c in columns if any(k in c.lower() for k in KNOWN_COLUMNS["content"])), None)
+        
+        if not time_col or not (content_col or title_col):
             logger.warning(f"[NEWS-L1] 无法识别数据列: {columns}")
             return None
+            
+        if not content_col:
+            content_col = title_col
         
         for idx, row in news_df.iterrows():
             try:
                 create_time = str(row[time_col])
-                content = str(row[content_col])
                 
                 try:
                     news_time = datetime.strptime(create_time, "%Y-%m-%d %H:%M:%S")
@@ -75,6 +70,14 @@ def fetch_layer1_em_akshare(hours=24):
                         continue
                 except Exception:
                     pass
+                    
+                title_text = str(row[title_col]) if title_col else ""
+                digest_text = str(row[content_col]) if content_col else ""
+                
+                if title_col and content_col and title_col != content_col and title_text and digest_text and title_text != digest_text:
+                    content = f"{title_text}。{digest_text}"
+                else:
+                    content = digest_text or title_text
                 
                 content = re.sub(r"<[^>]+>", "", content).strip()
                 if content:
@@ -111,6 +114,10 @@ def fetch_layer2_em_http(hours=24):
         response.raise_for_status()
         
         data = response.json()
+        if data.get("code", 0) not in (0, 200) or data.get("data") is None:
+            logger.warning(f"[NEWS-L2] 接口返回异常: code={data.get('code')}")
+            return None
+            
         list_data = data.get("data", {}).get("list", [])
         if not list_data:
             return None
@@ -256,9 +263,9 @@ def _rule_engine_fallback(news_list):
                     sector_counts[sector] += 1
                     
         # 简易风险提取 (股票代码)
-        matches = re.findall(r"\b(?:sh|sz|bj)([036]\d{5})\b|\(([036]\d{5})\)", content)
+        matches = re.findall(r"\b(?:sh|sz)([06]\d{5}|3\d{5})\b|\bbj(8[01]\d{4})\b|\(([036]\d{5}|8[01]\d{4})\)", content)
         for m in matches:
-            code = m[0] or m[1]
+            code = m[0] or m[1] or m[2]
             if code:
                 if code.startswith("6"):
                     risk_warnings.add(f"sh{code}")
@@ -348,7 +355,10 @@ def extract_sentiment_with_llm(news_list):
         result = json.loads(json_str)
 
         macro_sentiment = result.get("macro_sentiment", 0)
-        if not isinstance(macro_sentiment, int) or macro_sentiment < -2 or macro_sentiment > 2:
+        try:
+            macro_sentiment = int(macro_sentiment)
+            macro_sentiment = max(-2, min(2, macro_sentiment))
+        except (TypeError, ValueError):
             macro_sentiment = 0
 
         hot_sectors = result.get("hot_sectors", [])
@@ -376,8 +386,6 @@ def extract_sentiment_with_llm(news_list):
 
 def get_news_sentiment(hours=24):
     """主入口"""
-    llm_online = _check_llm_alive(timeout=5)
-    
     news_list, source = fetch_news_waterfall(hours)
     
     if source == "ALL_FAILED":
@@ -390,6 +398,8 @@ def get_news_sentiment(hours=24):
         }
         
     news_count = len(news_list)
+    
+    llm_online = _check_llm_alive(timeout=5)
     
     if llm_online:
         sentiment, llm_err = extract_sentiment_with_llm(news_list)
@@ -430,12 +440,19 @@ def fetch_stock_news(stock_code: str, limit: int = 5) -> list:
         if news_df is None or news_df.empty:
             return []
             
-        records = news_df[['新闻标题', '新闻内容', '发布时间']].head(limit).to_dict('records')
+        title_col = next((c for c in news_df.columns if "标题" in c), None)
+        content_col = next((c for c in news_df.columns if "内容" in c or "摘要" in c), None)
+        time_col = next((c for c in news_df.columns if "时间" in c), None)
+
+        if not all([title_col, time_col]): 
+            return []
+            
+        records = news_df.head(limit).to_dict('records')
         news_items = []
         for r in records:
             news_items.append({
-                "title": r["新闻标题"],
-                "publish_time": r["发布时间"],
+                "title": r[title_col],
+                "publish_time": r[time_col],
                 "sentiment": "中性"
             })
         return news_items
