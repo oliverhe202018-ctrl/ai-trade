@@ -1,4 +1,4 @@
-﻿"""
+"""
 Broker Adapter 层 - 抽象基类与模拟券商实现
 """
 import uuid
@@ -41,7 +41,7 @@ class BaseBroker(ABC):
 class MockBrokerAdapter(BaseBroker):
     def __init__(self):
         self.orders = {}
-        self.balance = {"cash": 100000.0, "total_equity": 100000.0}
+        self.balance = {"cash": 1_000_000.0, "total_equity": 1_000_000.0}
         self.positions = {}
         
     def place_order(self, code: str, action: str, qty: int, price_type: str, price: float) -> str:

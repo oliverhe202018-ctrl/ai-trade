@@ -12,8 +12,9 @@ MIN_COMMISSION = 5.0
 STAMP_DUTY_RATE = 0.001
 
 class OrderManager:
-    def __init__(self, broker: BaseBroker):
+    def __init__(self, broker: BaseBroker, is_mock: bool = False):
         self.broker = broker
+        self.is_mock = is_mock
         # 活跃订单池: order_id -> order_info
         self.active_orders = {}
 
@@ -65,12 +66,13 @@ class OrderManager:
                 newly_filled = filled_qty - last_settled
                 
                 if newly_filled > 0:
-                    self._update_portfolio(
-                        code=order["code"],
-                        action=order["action"],
-                        filled_qty=newly_filled,
-                        avg_price=avg_price
-                    )
+                    if not self.is_mock:
+                        self._update_portfolio(
+                            code=order["code"],
+                            action=order["action"],
+                            filled_qty=newly_filled,
+                            avg_price=avg_price
+                        )
                     order["settled_qty"] = filled_qty
                     logger.info(f"✅ [OrderManager] 订单 {order_id} 撮合成交! {order['action']} {order['code']} @ {avg_price:.2f} x {newly_filled}股")
                 

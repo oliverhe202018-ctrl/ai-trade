@@ -104,13 +104,15 @@ def select_stocks(quotes, positions, config, mode="mock"):
         pos.get("avg_price", 0) * pos.get("shares", 0) for pos in positions.values()
     )
 
+    cached_results: list = []
+    scored_stocks: list = []
+
     # 3. 大模型推理缓存拦截器
     if candidates:
         # 加载缓存
         ai_cache = _load_ai_cache()
         
         # 考前过滤：区分缓存命中和需要 AI 打分的股票
-        cached_results = []
         needs_ai_scoring = []
         
         for stock in candidates:
@@ -126,7 +128,6 @@ def select_stocks(quotes, positions, config, mode="mock"):
         logger.info(f"  [缓存拦截] 命中 {len(cached_results)} 只，需 AI 打分 {len(needs_ai_scoring)} 只")
         
         # 分批打分与错题本标记
-        scored_stocks = []
         if needs_ai_scoring:
             CHUNK_SIZE = 5
             chunks = [needs_ai_scoring[i:i + CHUNK_SIZE] for i in range(0, len(needs_ai_scoring), CHUNK_SIZE)]
