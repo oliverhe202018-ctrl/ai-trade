@@ -334,9 +334,11 @@ def module_news_sentiment():
 
     def _load_cache():
         try:
-            if cache_file.exists():
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
+            if not cache_file.exists():
+                st.info("⏳ 等待 brain_node 完成首轮演算...")
+                st.stop()
+            with open(cache_file, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception:
             pass
         return None
@@ -351,6 +353,11 @@ def module_news_sentiment():
         return
 
     ts_str = data.get("_datetime", "未知")
+    
+    cache_age = time.time() - data.get("_ts", 0)
+    if cache_age > 300:
+        st.warning(f"⚠️ 数据已 {int(cache_age//60)} 分钟未更新")
+        
     source = data.get("_source", "llm")
     news_count = data.get("_news_count", 0)
     macro = float(data.get("macro_sentiment", 0))
