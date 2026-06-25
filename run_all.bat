@@ -5,6 +5,8 @@ chcp 65001 >nul
 cd /d "%~dp0"
 
 set PYTHON_CMD=c:\users\a2515\appdata\local\hermes\hermes-agent\venv\Scripts\python.exe
+if not exist logs mkdir logs
+if not exist data_cache\health mkdir data_cache\health
 if not exist "%PYTHON_CMD%" (
     echo [STARTUP_FAIL] Python executable not found: %PYTHON_CMD%
     pause
@@ -29,8 +31,8 @@ start "AI Trader" cmd /k "%PYTHON_CMD% ai_trader.py || echo [STARTUP_FAIL] ai_tr
 echo [4/9] Starting Index Cache Updater...
 start "Index Cache Updater" cmd /k "%PYTHON_CMD% feeds\index_updater.py || echo [STARTUP_FAIL] index_updater failed && pause"
 
-echo [5/9] Starting News Fetcher...
-start "News Fetcher" cmd /k "%PYTHON_CMD% datahub\news_fetcher.py || echo [STARTUP_FAIL] news_fetcher failed && pause"
+echo [5/9] Starting Event Radar...
+start "Event Radar" cmd /k "%PYTHON_CMD% datahub\event_radar.py || echo [STARTUP_FAIL] event_radar failed && pause"
 
 echo [6/9] Starting Event Extractor...
 start "Event Extractor" cmd /k "%PYTHON_CMD% nlp\event_extractor.py || echo [STARTUP_FAIL] event_extractor failed && pause"

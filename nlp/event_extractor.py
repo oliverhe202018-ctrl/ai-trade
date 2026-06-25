@@ -125,18 +125,25 @@ Text:
 {cleaned_text[:2000]}
 """
     try:
+        import os
+        llm_base_url = os.getenv("LLM_BASE_URL", "http://localhost:8080")
+        
+        # If it's llama.cpp, we use the OpenAI compatible endpoint:
+        # http://localhost:8080/v1/chat/completions
         response = requests.post(
-            'http://localhost:11434/api/generate',
+            f"{llm_base_url}/v1/chat/completions",
             json={
-                "model": "llama3",
-                "prompt": prompt,
-                "stream": False,
-                "format": "json"
+                "messages": [
+                    {"role": "system", "content": "You are a helpful financial assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.1
             },
             timeout=15
         )
         if response.status_code == 200:
-            result_json = response.json().get('response', '{}')
+            result_json = response.json().get('choices', [{}])[0].get('message', {}).get('content', '{}')
             parsed = json.loads(result_json)
             
             try:
@@ -160,123 +167,130 @@ Text:
 
 def worker_process_raw_news():
     setup_tables()
-    logger.info("Starting background worker for raw news processing...")
+    from core.health_bus import write_heartbeat
+    import json
+    from pathlib import Path
+    import os
+    
+    logger.info("Starting background worker for radar event processing...")
+    project_root = Path(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+    events_file = project_root / "data_cache" / "events" / "latest_events.json"
+    
+    last_processed_ids = set()
     
     while True:
         try:
+            if not events_file.exists():
+                write_heartbeat(
+                    channel="L3",
+                    status="NO_INPUT",
+                    source="nlp/event_extractor.py",
+                    message="NO_INPUT",
+                    extra={"events_processed": 0}
+                )
+                time.sleep(5)
+                continue
+                
+            try:
+                with events_file.open("r", encoding="utf-8") as f:
+                    events = json.load(f)
+            except Exception as e:
+                logger.error(f"Failed to load latest_events.json: {e}")
+                events = []
+                
+            new_events = [e for e in events if e.get("event_id") not in last_processed_ids]
+            
+            if not new_events:
+                write_heartbeat(
+                    channel="L3",
+                    status="NO_INPUT",
+                    source="nlp/event_extractor.py",
+                    message="NO_INPUT",
+                    extra={"events_processed": 0}
+                )
+                time.sleep(5)
+                continue
+                
+            processed_count = 0
             with get_db_conn() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT id, symbol, title, content, publish_time, created_at, provider, raw_data, content_hash, source_url FROM raw_news WHERE status = 'raw' LIMIT 50")
-                rows = cursor.fetchall()
                 
-                if not rows:
-                    time.sleep(5)
-                    continue
+                for event in new_events:
+                    event_id = event.get('event_id')
+                    symbol = event.get('symbol', '')
+                    title = event.get('title', '')
+                    publish_time = event.get('published_at', '')
+                    event_type = event.get('event_type', 'announcement')
+                    source_url = event.get('url', '')
+                    importance = event.get('importance', 'low')
+                    reason = event.get('reason', '')
                     
-                for row in rows:
-                    news_id = row['id']
-                    symbol = row['symbol']
-                    title = row['title'] or ''
-                    content = row['content'] or ''
-                    raw_publish_time = row['publish_time']
-                    raw_created_at = row['created_at']
-                    provider = row['provider']
-                    raw_data = row['raw_data']
-                    content_hash = row['content_hash']
-                    db_source_url = row['source_url'] if 'source_url' in row.keys() else None
-                    
-                    source_url = db_source_url if db_source_url else extract_source_url(raw_data)
-                    if not source_url:
-                        logger.info(f"[EVENT_SOURCE_URL_MISSING] Source URL not found for news_id {news_id}")
-                        
-                    publish_time_dt = parse_datetime_safe(raw_publish_time)
-                    if publish_time_dt:
-                        publish_time_str = raw_publish_time
-                        stale = compute_stale_flag(publish_time_dt)
-                    else:
-                        publish_time_str = raw_publish_time
-                        stale = 1
-                        logger.warning(f"[EVENT_PUBLISH_TIME_MISSING] Missing or invalid publish_time for news_id {news_id}")
-                        
-                    fetch_time = raw_created_at if raw_created_at else datetime.now().isoformat()
-                    
-                    if content_hash:
-                        cursor.execute("SELECT event_type, summary, polarity, key_facts, confidence, novelty, risk_flags FROM event_cards WHERE content_hash = ? LIMIT 1", (content_hash,))
-                        existing_card = cursor.fetchone()
-                        if existing_card:
-                            logger.info(f"[EVENT_CARD_INSERT] Reusing event_card for news_id {news_id}")
-                            logger.info(f"[EVENT_CARD_STALE] news_id {news_id} stale flag is {stale}")
-                            cursor.execute('''
-                                INSERT INTO event_cards (symbol, event_type, summary, source_news_id, polarity, key_facts, content_hash, confidence, novelty, risk_flags, publish_time, fetch_time, stale, source_url)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            ''', (
-                                symbol,
-                                existing_card['event_type'],
-                                existing_card['summary'],
-                                news_id,
-                                existing_card['polarity'],
-                                existing_card['key_facts'],
-                                content_hash,
-                                existing_card['confidence'],
-                                existing_card['novelty'],
-                                existing_card['risk_flags'],
-                                publish_time_str,
-                                fetch_time,
-                                stale,
-                                source_url
-                            ))
-                            cursor.execute("UPDATE raw_news SET status = 'processed' WHERE id = ?", (news_id,))
-                            conn.commit()
-                            continue
-                    
-                    combined_text = f"{title}. {content}"
-                    cleaned_text = clean_text(combined_text)
-                    
-                    if not cleaned_text:
-                        cursor.execute("UPDATE raw_news SET status = 'skipped' WHERE id = ?", (news_id,))
-                        conn.commit()
+                    if not symbol or not title:
+                        last_processed_ids.add(event_id)
                         continue
+                        
+                    # We skip LLM generation for basic events to save cost
+                    # Just map the title as summary
+                    summary = title
+                    polarity = 0
+                    if importance == "high":
+                        polarity = -0.5 if event_type in ("abnormal_volatility", "risk_warning", "reduction") else 0.5
                     
-                    event_card = generate_event_card(news_id, symbol, cleaned_text)
+                    content_hash = f"{event_id}_{symbol}"
+                    fetch_time = datetime.now().isoformat()
                     
-                    if not event_card:
-                        logger.warning(f"[SCHEMA_VALIDATION_FAIL] Skipping news_id {news_id} because of bad AI generation")
-                        cursor.execute("UPDATE raw_news SET status = 'skipped_bad_schema' WHERE id = ?", (news_id,))
-                        conn.commit()
-                        continue
-                    
-                    key_facts_json = json.dumps(event_card.get('key_facts', []), ensure_ascii=False)
-                    
-                    logger.info(f"[EVENT_CARD_INSERT] Generated new event_card for news_id {news_id}")
-                    logger.info(f"[EVENT_CARD_STALE] news_id {news_id} stale flag is {stale}")
                     cursor.execute('''
                         INSERT INTO event_cards (symbol, event_type, summary, source_news_id, polarity, key_facts, content_hash, confidence, novelty, risk_flags, publish_time, fetch_time, stale, source_url)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
-                        event_card['symbol'],
-                        event_card['event_type'],
-                        event_card['summary'],
-                        news_id,
-                        event_card['polarity'],
-                        key_facts_json,
+                        symbol,
+                        event_type,
+                        summary,
+                        0, # No raw_news id anymore
+                        polarity,
+                        json.dumps([reason], ensure_ascii=False) if reason else "[]",
                         content_hash,
-                        event_card['confidence'],
-                        event_card['novelty'],
-                        event_card['risk_flags'],
-                        publish_time_str,
+                        0.9, # High confidence for official announcements
+                        0.8,
+                        "[]",
+                        publish_time,
                         fetch_time,
-                        stale,
+                        0, # not stale yet
                         source_url
                     ))
                     
-                    cursor.execute("UPDATE raw_news SET status = 'processed' WHERE id = ?", (news_id,))
-                    conn.commit()
-                    
-                    logger.info(f"Processed news_id {news_id} for symbol {symbol}")
-                    
+                    last_processed_ids.add(event_id)
+                    processed_count += 1
+                
+                conn.commit()
+                
+            # Limit the set size to prevent memory leak
+            if len(last_processed_ids) > 2000:
+                last_processed_ids = set(list(last_processed_ids)[-1000:])
+            
+            if processed_count > 0:
+                write_heartbeat(
+                    channel="L3",
+                    status="OK",
+                    source="nlp/event_extractor.py",
+                    message="events extracted",
+                    extra={"events_processed": processed_count}
+                )
+                
         except Exception as e:
             logger.error(f"Error in worker_process_raw_news: {e}")
+            try:
+                write_heartbeat(
+                    channel="L3",
+                    status="ERROR",
+                    source="nlp/event_extractor.py",
+                    message=str(e)
+                )
+            except Exception as hb_err:
+                pass
             time.sleep(5)
+            
+        time.sleep(10)
 
 if __name__ == '__main__':
     t = threading.Thread(target=worker_process_raw_news, daemon=True)

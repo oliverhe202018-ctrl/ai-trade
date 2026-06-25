@@ -275,7 +275,10 @@ def sidebar_status_panel():
             st.sidebar.markdown(f"**延迟**: {delay:.1f} 秒")
             st.sidebar.markdown(f"**最后更新**: {health.get('datetime', 'N/A')}")
         except Exception:
-            st.sidebar.error("读取行情健康状态失败")
+            st.sidebar.markdown("**主数据源**: UNKNOWN")
+            st.sidebar.markdown("**状态**: 🔴 DOWN")
+            st.sidebar.markdown("**延迟**: N/A")
+            st.sidebar.markdown("**最后更新**: N/A")
     else:
         st.sidebar.warning("等待行情源初始化...")
 
@@ -310,6 +313,27 @@ def sidebar_status_panel():
                 unsafe_allow_html=True
             )
     
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📰 资讯源健康度")
+    news_health_path = os.path.join(CACHE_DIR, "news_health.json")
+    if os.path.exists(news_health_path):
+        try:
+            import json
+            with open(news_health_path, "r", encoding="utf-8") as f:
+                news_health = json.load(f)
+                
+            for p_name, p_data in news_health.get("providers", {}).items():
+                p_status = p_data.get("status", "UNKNOWN")
+                p_status_color = "🟢" if p_status == "OK" else "🔴" if p_status == "DOWN" else "🟡"
+                st.sidebar.markdown(f"**{p_name.upper()}**: {p_status_color} {p_status}")
+                
+            st.sidebar.markdown(f"**最后更新**: {news_health.get('datetime', 'N/A')}")
+        except Exception:
+            st.sidebar.markdown("**状态**: 🔴 解析失败 (UNKNOWN)")
+    else:
+        st.sidebar.markdown("**状态**: 🟡 未初始化")
+        
     # 系统信息
     st.sidebar.markdown("---")
     st.sidebar.markdown("### ℹ️ 系统信息")
@@ -492,8 +516,8 @@ def send_control_command(cmd_dict: dict, timeout_ms: int = 3000):
 def _render_risk_canopy_and_kill_switch():
     current_state = get_trading_state()
     
-    if current_state == TradingState.RUNNING.value:
-        state_label = "🟢 正常交易 (RUNNING)"
+    if current_state == TradingState.ACTIVE.value:
+        state_label = "🟢 正常交易 (ACTIVE)"
     elif current_state == TradingState.PAUSED.value:
         state_label = "🟡 买入暂停 (PAUSED)"
     elif current_state == TradingState.FROZEN.value:
@@ -563,6 +587,115 @@ def _render_manual_order_fragment():
                 # 这里暂作 UI 交互回馈，实际的 ZMQ 5556 通信逻辑如果还在则会触发
                 st.success(f"已成功向控制总线发送 {action} 指令: {code} ({qty}股) - {price_type}")
 
+def get_llm_health_status():
+    import os
+    import requests
+    import time
+    
+    llm_base_url = os.getenv("LLM_BASE_URL", "http://localhost:8080")
+    llm_provider = os.getenv("LLM_PROVIDER", "Llama.cpp")
+    source_name = f"{llm_provider} ({llm_base_url.replace('http://', '').replace('https://', '')})"
+    
+    llm_info = {
+        "status": "OFFLINE",
+        "latency_ms": None,
+        "source": source_name,
+        "error": None
+    }
+    
+    t0 = time.time()
+    try:
+        # primary
+        res = requests.get(f"{llm_base_url}/health", timeout=2.0)
+        if res.status_code == 200:
+            llm_info["latency_ms"] = int((time.time() - t0) * 1000)
+            llm_info["status"] = "ONLINE"
+            return llm_info
+    except Exception as e:
+        llm_info["error"] = str(e)
+        
+    try:
+        # fallback
+        res = requests.get(f"{llm_base_url}/v1/models", timeout=2.0)
+        if res.status_code == 200:
+            llm_info["latency_ms"] = int((time.time() - t0) * 1000)
+            llm_info["status"] = "ONLINE"
+            llm_info["error"] = None
+    except Exception as e:
+        llm_info["error"] = str(e)
+        
+    return llm_info
+
+def parse_iso_time(value: str):
+    if not value:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def get_feed_channel_health():
+    from datetime import datetime, timezone
+    from core.health_bus import read_heartbeat
+    result = []
+
+    for channel in ["L1", "L2", "L3"]:
+        hb = read_heartbeat(channel)
+
+        if not hb:
+            result.append({
+                "level": channel,
+                "status": "MISSING",
+                "delay_minutes": None,
+                "last_seen": None,
+                "source": None,
+                "message": "未找到 heartbeat 文件",
+            })
+            continue
+
+        try:
+            last_seen = parse_iso_time(hb.get("last_seen"))
+            if last_seen is None:
+                raise ValueError("last_seen is empty")
+
+            now = datetime.now(timezone.utc)
+            delay_minutes = int((now - last_seen).total_seconds() // 60)
+
+            raw_status = hb.get("status", "UNKNOWN")
+            source = hb.get("source")
+            message = hb.get("message")
+
+            if raw_status == "ERROR":
+                status = "ERROR"
+            elif delay_minutes <= 5:
+                status = "OK"
+            elif delay_minutes <= 30:
+                status = "STALE"
+            else:
+                status = "DOWN"
+
+            result.append({
+                "level": channel,
+                "status": status,
+                "delay_minutes": delay_minutes,
+                "last_seen": hb.get("last_seen"),
+                "source": source,
+                "message": message,
+            })
+
+        except Exception as e:
+            result.append({
+                "level": channel,
+                "status": "UNKNOWN",
+                "delay_minutes": None,
+                "last_seen": hb.get("last_seen"),
+                "source": hb.get("source"),
+                "message": f"heartbeat 解析失败: {e}",
+            })
+
+    return result
+
 @st.fragment(run_every="5s")
 def _render_top_metrics_fragment():
     """渲染顶部的风控与资源占用 Metrics"""
@@ -572,8 +705,8 @@ def _render_top_metrics_fragment():
     with cols[1]:
         st.metric("内存占用", f"{psutil.virtual_memory().percent}%")
     with cols[2]:
-        # 如果有真实的 ping 函数请调用，否则暂时显示占位
-        st.metric("LLM 状态", "ONLINE") 
+        llm_info = get_llm_health_status()
+        st.metric("LLM 状态", llm_info["status"]) 
     with cols[3]:
         # 从 trading_state 获取真实状态，如果没有先给个安全默认值
         current_state = get_trading_state()
@@ -584,31 +717,52 @@ def _render_system_health_check_fragment():
     st.subheader("🏥 系统健康度探针 (Health Check)")
     
     # 1. LLM 通道状态
-    import requests
-    llm_status = "🔴 离线"
-    llm_latency = "N/A"
-    try:
-        t0 = time.time()
-        res = requests.get('http://localhost:11434/api/tags', timeout=1.0)
-        if res.status_code == 200:
-            llm_latency = f"{(time.time() - t0)*1000:.0f}ms"
-            llm_status = "🟢 可用"
-    except:
-        pass
+    llm_info = get_llm_health_status()
+    if llm_info["status"] == "ONLINE":
+        llm_status_text = "🟢 正常"
+        llm_latency_text = f"{llm_info['latency_ms']}ms"
+    elif llm_info["status"] == "OFFLINE":
+        llm_status_text = "🔴 离线"
+        llm_latency_text = "N/A"
+    else:
+        llm_status_text = "⚪ 未知"
+        llm_latency_text = "N/A"
         
     # 2. 数据源新鲜度
-    def get_file_freshness(filename):
-        filepath = CACHE_DIR / filename
-        if not filepath.exists():
-            return "🔴 缺失", 99999
-        mtime = filepath.stat().st_mtime
-        delay_mins = (time.time() - mtime) / 60
-        status = "🟢 新鲜" if delay_mins < 30 else "🔴 严重延迟"
-        return status, delay_mins
+    feed_healths = get_feed_channel_health()
+    feed_texts = {}
+    for item in feed_healths:
+        level = item["level"]
+        status = item["status"]
+        delay = item["delay_minutes"]
+        message = item.get("message") or ""
+        source = item.get("source") or "unknown"
         
-    l1_stat, l1_del = get_file_freshness("news_layer1.json")
-    l2_stat, l2_del = get_file_freshness("news_layer2.json")
-    l3_stat, l3_del = get_file_freshness("news_layer3.json")
+        # Keep short source name
+        source_short = source.split("/")[-1] if "/" in source else source
+        
+        if status == "OK":
+            feed_texts[level] = f"🟢 正常 ({delay}m) - {source_short}"
+        elif status == "STALE":
+            feed_texts[level] = f"🟡 延迟 ({delay}m) - {source_short}"
+        elif status == "DOWN":
+            feed_texts[level] = f"🔴 中断 ({delay}m) - {source_short}"
+        elif status == "ERROR":
+            feed_texts[level] = f"🔴 错误 - {message}"
+        elif status == "EMPTY":
+            feed_texts[level] = f"🟡 无新数据 - {message}"
+        elif status == "SOURCE_DOWN":
+            feed_texts[level] = f"🔴 源不可用 - {message}"
+        elif status == "NO_INPUT":
+            feed_texts[level] = f"🟡 无输入 - {message}"
+        elif status == "MISSING":
+            feed_texts[level] = f"🔴 缺失 - {message}"
+        else:
+            feed_texts[level] = f"⚪ 未知 - {message}"
+
+    l1_text = feed_texts.get("L1", "⚪ 未知")
+    l2_text = feed_texts.get("L2", "⚪ 未知")
+    l3_text = feed_texts.get("L3", "⚪ 未知")
     
     # 3. 对账状态灯 & 心跳
     hb_file = CACHE_DIR / "heartbeats.json"
@@ -627,22 +781,28 @@ def _render_system_health_check_fragment():
     try:
         from core.trading_state import get_trading_state, TradingState
         t_state = get_trading_state()
-        state_color = "green" if t_state == TradingState.ACTIVE.value else "red"
-        state_html = f"<b style='color:{state_color}'>{t_state}</b>"
+        if t_state == TradingState.ACTIVE.value:
+            state_text = f"🟢 {t_state}"
+        elif t_state == TradingState.PAUSED.value:
+            state_text = f"🟡 {t_state}"
+        elif t_state in (TradingState.FROZEN.value, TradingState.EMERGENCY.value):
+            state_text = f"🔴 {t_state}"
+        else:
+            state_text = f"⚪ {t_state}"
     except:
-        state_html = "未知"
+        state_text = "⚪ UNKNOWN"
         t_state = "UNKNOWN"
         
     # UI Render
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.info(f"**🧠 LLM 状态**\n\n状态: {llm_status}\n\n延迟: {llm_latency}")
+        st.info(f"**🧠 LLM 状态**\n\n状态: {llm_status_text}\n\n延迟: {llm_latency_text}\n\n来源: {llm_info['source']}")
     with c2:
-        st.info(f"**📰 资讯通道延迟**\n\nL1: {l1_stat} ({l1_del:.0f}m)\n\nL2: {l2_stat} ({l2_del:.0f}m)\n\nL3: {l3_stat} ({l3_del:.0f}m)")
+        st.info(f"**📡 事件雷达状态**\n\nL1: {l1_text}\n\nL2: {l2_text}\n\nL3: {l3_text}")
     with c3:
         st.info(f"**💓 核心模块心跳**\n\nTrader: {trader_status} ({trader_delay:.0f}s)\n\nBrain: {brain_status} ({brain_delay:.0f}s)")
     with c4:
-        st.info(f"**⚙️ 全局交易状态机**\n\n当前状态: {state_html}")
+        st.info(f"**⚙️ 全局交易状态机**\n\n当前状态: {state_text}")
         if t_state in ("FROZEN", "DEGRADED", "EMERGENCY"):
             # 尝试提取最后一行错误日志
             log_file = CACHE_DIR.parent / "logs" / "app.log"
@@ -659,6 +819,41 @@ def _render_system_health_check_fragment():
                 st.caption(f"⚠️ {last_err}")
                 
     st.markdown("---")
+    
+    # 事件雷达诊断
+    def diagnose_feed_channels():
+        from pathlib import Path
+        from datetime import datetime
+        checks = []
+        project_root = Path(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+        health_dir = project_root / "data_cache" / "health"
+        events_dir = project_root / "data_cache" / "events"
+        
+        for channel in ["L1", "L2", "L3"]:
+            path = health_dir / f"{channel.lower()}_heartbeat.json"
+            checks.append({
+                "channel": channel,
+                "path": str(path),
+                "exists": path.exists(),
+                "mtime": datetime.fromtimestamp(path.stat().st_mtime).isoformat() if path.exists() else None,
+            })
+            
+        source_status_path = events_dir / "source_status.json"
+        if source_status_path.exists():
+            try:
+                import json
+                with source_status_path.open("r", encoding="utf-8") as f:
+                    checks.append({
+                        "channel": "Event Radar Sources",
+                        "status": json.load(f)
+                    })
+            except:
+                pass
+                
+        return checks
+        
+    with st.expander("🛠️ 事件雷达及底层总线诊断"):
+        st.json(diagnose_feed_channels())
 
 def module_portfolio_dashboard():
     """模块 1：资产监控大屏（企业级重构版）"""
@@ -1676,6 +1871,28 @@ def module_news_sentiment():
     with st.expander('🔧 完整 JSON 诊断', expanded=False):
         st.json(data)
 
+
+def module_observation_reports():
+    st.header("👀 72 小时并行观察报告")
+    st.markdown("这里汇集了最新一轮脚本自动扫描生成的报告文件。如果文件不存在请确保运行了 `scripts/run_72h_observation.py`。")
+    
+    report_files = {
+        "📊 总体状态报告 (observation_72h_status.md)": os.path.join(PROJECT_ROOT, "reports", "observation_72h_status.md"),
+        "📈 模拟盘观察报告 (paper_trading_observation.md)": os.path.join(PROJECT_ROOT, "reports", "paper_trading_observation.md"),
+        "📰 资讯只读观察报告 (news_readonly_observation.md)": os.path.join(PROJECT_ROOT, "reports", "news_readonly_observation.md")
+    }
+    
+    for title, path in report_files.items():
+        with st.expander(title, expanded=False):
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        st.markdown(f.read())
+                except Exception as e:
+                    st.error(f"读取失败: {e}")
+            else:
+                st.warning(f"报告文件未生成: {path}")
+
 def main():
     """主入口"""
     st.title("🚀 AI Trader 量化系统控制台")
@@ -1684,7 +1901,7 @@ def main():
     st.sidebar.title("导航菜单")
     selected_module = st.sidebar.radio(
         "选择模块",
-        ["📊 资产监控大屏", "📰 资讯情绪中枢", "📈 Paper Trading 监控", "📋 自选股管理", "📜 系统运行日志", "📜 历史复盘"],
+        ["📊 资产监控大屏", "📰 资讯情绪中枢", "📈 Paper Trading 监控", "📋 自选股管理", "📜 系统运行日志", "📜 历史复盘", "👀 72小时观察报告"],
         index=0
     )
 
@@ -1713,6 +1930,8 @@ def main():
         module_system_logs()
     elif selected_module == "📜 历史复盘":
         module_history_review()
+    elif selected_module == "👀 72小时观察报告":
+        module_observation_reports()
 
 
 if __name__ == "__main__":

@@ -273,7 +273,17 @@ def run_live_trader():
             if cash > 0 and order_amount > cash * 0.1 and order.get('quantity', 0) >= 300:
                 if market_provider:
                     try:
+                        tick = market_provider.get_realtime_quote(order['code'])
+                        vol = tick.get('volume')
+                        amt = tick.get('amount')
+                        if vol is None or amt is None or vol == 0 or amt == 0:
+                            logger.warning(f"[TWAP_CANCEL] {order['code']} 缺少成交量或成交额字段，无流动性，取消大额拆单！")
+                            continue
+                            
                         ob = market_provider.get_orderbook(order['code'])
+                        if ob is None:
+                            logger.warning(f"[TWAP_WARN] {order['code']} 缺少五档盘口，返回None。")
+                            ob = {}
                         ask_price = ob.get("askPrice", [0])[0] if ob.get("askPrice") else 0
                         ask_vol = ob.get("askVol", [0])[0] if ob.get("askVol") else 0
                         bid_price = ob.get("bidPrice", [0])[0] if ob.get("bidPrice") else 0

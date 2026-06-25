@@ -315,6 +315,7 @@ def process_symbol_with_providers(symbol, providers, circuit_breaker):
 def scheduler_loop():
     init_db()
     import random
+    from core.health_bus import write_heartbeat
     providers = [AkshareProvider(), EastMoneyProvider(), LocalCacheProvider()]
     circuit_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout_minutes=5)
     
@@ -323,11 +324,40 @@ def scheduler_loop():
     while True:
         try:
             symbols = get_held_stocks()
+            success_count = 0
             for symbol in symbols:
-                process_symbol_with_providers(symbol, providers, circuit_breaker)
+                success = process_symbol_with_providers(symbol, providers, circuit_breaker)
+                if success:
+                    success_count += 1
+            
+            if success_count > 0:
+                write_heartbeat(
+                    channel="L2",
+                    status="OK",
+                    source="datahub/news_fetcher.py",
+                    message="news fetched",
+                    extra={"symbols_processed": len(symbols), "success_count": success_count}
+                )
+            else:
+                write_heartbeat(
+                    channel="L2",
+                    status="OK",
+                    source="datahub/news_fetcher.py",
+                    message="no news returned",
+                    extra={"symbols_processed": len(symbols), "success_count": 0}
+                )
             
         except Exception as e:
             logger.error(f"Scheduler loop error: {e}")
+            try:
+                write_heartbeat(
+                    channel="L2",
+                    status="ERROR",
+                    source="datahub/news_fetcher.py",
+                    message=str(e)
+                )
+            except Exception as hb_err:
+                logger.error(f"Failed to write L2 heartbeat: {hb_err}")
             
         base_sleep = 180
         jitter = random.uniform(10, 60)

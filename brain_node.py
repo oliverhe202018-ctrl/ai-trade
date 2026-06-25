@@ -175,7 +175,7 @@ def _check_momentum_resonance(code, candidate, hot_sectors, stock_history):
             return False, "无法获取今日快照"
             
         today_vol = tick.get("volume", 0)
-        # xtdata doesn't always provide lastClose in our mapped dict (we mapped it to price if lastPrice is missing), so let's check
+        # qmt provider doesn't always provide lastClose in our mapped dict (we mapped it to price if lastPrice is missing), so let's check
         last_close = tick.get("lastClose", tick.get("price", 0.0))
         open_price = tick.get("open", 0.0)
         
@@ -309,8 +309,14 @@ def run_brain_node():
         try:
             if market_provider:
                 health_data = market_provider.health_check()
-                with open(os.path.join(PROJECT_ROOT, "data_cache", "market_health.json"), "w", encoding="utf-8") as f:
+                import tempfile
+                health_file_path = os.path.join(PROJECT_ROOT, "data_cache", "market_health.json")
+                dir_name = os.path.dirname(health_file_path)
+                os.makedirs(dir_name, exist_ok=True)
+                fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".json")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump(health_data, f)
+                os.replace(tmp_path, health_file_path)
         except Exception as e:
             logger.error(f"写入行情健康状态失败: {e}")
             
@@ -428,7 +434,12 @@ def run_brain_node():
                     continue
 
                 try:
-                    atr = calculate_atr(_stock_history.get(code))
+                    hist_data = _stock_history.get(code)
+                    if hist_data is None or len(hist_data) < 20:
+                        logger.warning(f"[K线不足] {code} 历史数据不足20根，无法计算真实 ATR 与指标，默认跳过，返回 NO_TRADE。")
+                        continue
+                        
+                    atr = calculate_atr(hist_data)
                     position_size = calculate_position_size(
                         portfolio.get("cash", 0),
                         candidate.get("price", 0),

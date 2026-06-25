@@ -50,6 +50,7 @@ def fetch_sh000001():
     return round(change_pct, 2)
 
 def update_cache():
+    from core.health_bus import write_heartbeat
     try:
         change_pct = fetch_sh000001()
         data = {
@@ -68,8 +69,26 @@ def update_cache():
             
         os.replace(tmp_file, INDEX_CACHE_FILE)
         logger.info(f"[INDEX_CACHE_UPDATE] sh000001 change_pct={change_pct}% updated successfully.")
+        
+        write_heartbeat(
+            channel="L1",
+            status="OK",
+            source="feeds/index_updater.py",
+            message="index cache updated"
+        )
     except Exception as e:
         logger.error(f"[INDEX_CACHE_UPDATE_FAIL] Failed to update index cache: {e}")
+        try:
+            write_heartbeat(
+                channel="L1",
+                status="ERROR",
+                source="feeds/index_updater.py",
+                message=str(e)
+            )
+        except Exception as hb_err:
+            logger.error(f"Failed to write heartbeat: {hb_err}")
+        # Note: According to the plan, we don't swallow exceptions if it was raising them, 
+        # but the original code was just logging the error. So we keep the original behavior.
 
 def main():
     import os
