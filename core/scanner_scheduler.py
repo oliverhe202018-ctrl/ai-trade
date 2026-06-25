@@ -105,6 +105,8 @@ def run_scan_once(cfg: dict | None = None) -> list[dict]:
     # 发通知
     if high_scorers:
         from core.notification_service import notify_event
+
+        # ── Scanner 信号通知 ──
         for c in high_scorers[:TOP_N]:
             code = c.get("code", "?")
             name = c.get("name", "")
@@ -114,8 +116,19 @@ def run_scan_once(cfg: dict | None = None) -> list[dict]:
                 "全市场扫描高分发现",
                 symbol=f"{code} {name}".strip(),
                 message=f"评分: {score}\n名称: {name}",
-                level="warning" if score >= 90 else "info",
+                level="critical" if score >= 90 else "warning",
             )
+
+        # ── 短线策略运行 (Phase 10) ──
+        try:
+            from strategies.short_term_strategy import run_short_term_analysis
+            strategy_signals = run_short_term_analysis(candidates=candidates)
+            if strategy_signals:
+                logger.info(
+                    f"[ScannerScheduler] 短线策略产出 {len(strategy_signals)} 个信号"
+                )
+        except Exception as e:
+            logger.warning(f"[ScannerScheduler] 短线策略运行异常: {e}")
 
     return high_scorers
 

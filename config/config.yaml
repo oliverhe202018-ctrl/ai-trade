@@ -68,7 +68,9 @@ notify:
 scanner:
   auto_run: false
   interval_seconds: 60
+  top_n: 30
   alert_score_threshold: 80
+  critical_score_threshold: 90
 poll_interval: 300
 broker:
   account_id: '8881541669'
