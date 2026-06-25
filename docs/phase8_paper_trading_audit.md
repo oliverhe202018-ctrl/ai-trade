@@ -132,14 +132,21 @@
 
 ### 4.3 ❌ 当前不可算（标记为 unavailable）
 
-| 指标 | 阻塞原因 |
-|------|---------|
-| `total_return` | 需要净值序列 (market_value + cash over time) |
-| `win_rate` | 需要每个已平仓交易的实际盈亏 (realized_pnl)，fills 缺少 realized_pnl 字段 |
-| `avg_win / avg_loss` | 同上 |
-| `profit_factor` | 同上 |
-| `max_drawdown` | 需要日频净值曲线 |
-| `sharpe_ratio` | 需要日频收益率序列 |
+以下指标标记为 unavailable，并附带不可计算原因：
+
+| 指标 | 不可计算原因 |
+|------|-------------|
+| `total_return` | 需要净值序列 (cash + market_value over time)；当前 paper_portfolio 无价格快照历史 |
+| `win_rate` | fills 缺少 `realized_pnl` 字段，无法从成交流水直接算出每笔盈亏 |
+| `avg_win / avg_loss` | 同上 — 无逐笔 realized_pnl |
+| `profit_factor` | 同上 — 总盈利/总亏损需要每笔盈亏 |
+| `max_drawdown` | 需要日频净值曲线；paper 当前不记录历史净值 |
+| `sharpe_ratio` | 需要日频收益率序列；同 max_drawdown |
+| `market_value` | 需要每只持仓的实时价格；当前 paper 链路未接入行情源 |
+| `total_equity` | = cash + market_value，依赖 market_value |
+| `unrealized_pnl` | = market_value - cost_basis，依赖 market_value |
+
+> 核心阻塞原因：**paper_portfolio.json 不含 current_price，paper 链路未接入 QMT xtdata / Tencent API 行情推送**。这些都是不可计算的根本原因，第一版如实标记为 unavailable，不做伪造。
 
 ### 4.4 稳定性指标
 
@@ -257,8 +264,12 @@ Phase 8d: 展示层
 ✅ 完成 run_72h_observation.py 可复用性审计
 ✅ 完成 backtester.py 可复用性审计
 ✅ 明确 10 个可直接计算的指标
-✅ 明确 8 个当前不可算的指标及阻塞原因
+✅ 明确 9 个当前不可算的指标及不可计算原因
 ✅ 输出的 paper_trading_performance.md 数据来自 fills/portfolio（非硬编码）
-✅ 不修改真实交易链路
+✅ 不修改真实交易链路 (live_trader.py, brain_node.py, broker_adapter.py 均不修改)
+✅ 不发送 TRADE_SIGNAL
+✅ 不连接 QMT 下单
+✅ 不写 live_portfolio.json / portfolio.json
+✅ Paper Trading 结果只用于观察与复盘
 ✅ 不新增实盘能力
 ```
