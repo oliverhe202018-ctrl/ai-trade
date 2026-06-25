@@ -15,7 +15,9 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.backtester import CACHE_DIR, LOGS_DIR
+from core.backtester import CACHE_DIR
+from core.logger_config import LOG_DIR
+LOGS_DIR = Path(LOG_DIR)
 from core.state_manager import load_portfolio
 from core.trading_state import get_trading_state, TradingState
 
