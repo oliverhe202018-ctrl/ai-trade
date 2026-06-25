@@ -40,6 +40,10 @@ from core.state_manager import load_portfolio
 from core.backtester import BACKTEST_UNIVERSE
 from core.trading_state import get_trading_state, TradingState
 
+PAPER_MODE = os.environ.get("PAPER_MODE", "0") == "1" or "--paper" in sys.argv
+if PAPER_MODE:
+    logger.info("🛡️ [PAPER MODE] 独立模拟盘日志解耦架构启用，实盘交易将被完全物理拦截！")
+
 LIVE_UNIVERSE = BACKTEST_UNIVERSE
 
 # ==========================================
@@ -54,6 +58,18 @@ def _is_dca_locked(code: str) -> bool:
 def _set_dca_lock(code: str):
     today = datetime.now().strftime("%Y-%m-%d")
     _dca_daily_lock[code] = today
+
+def _append_paper_signal(order: dict):
+    """
+    独立模拟盘日志写入（解耦架构）
+    """
+    log_file = os.path.join(PROJECT_ROOT, "data_cache", "paper_signal_log.jsonl")
+    try:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(order, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.error(f"[PaperMode] 写入模拟信号失败: {e}")
 
 # ==========================================
 # 📡 大盘缓存读取 + 陈旧计数器
@@ -203,9 +219,11 @@ except Exception as e:
 def run_brain_node():
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
-    socket.bind("tcp://*:5555")
-    
-    logger.info("✅ ZeroMQ 广播频道已绑定 tcp://*:5555")
+    if not PAPER_MODE:
+        socket.bind("tcp://*:5555")
+        logger.info("✅ ZeroMQ 广播频道已绑定 tcp://*:5555")
+    else:
+        logger.info("🛡️ [PAPER MODE] 物理断开 ZMQ 绑定，确保模拟信号完全只写本地日志。")
 
     # ===============================================================
     # 历史数据预热（启动时一次性加载，后续增量更新）
@@ -334,8 +352,12 @@ def run_brain_node():
             for sell_order in sell_signals:
                 try:
                     order = _serialize_order(sell_order)
-                    socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
-                    logger.info(f"[卖出广播] {sell_order.get('code')} {sell_order.get('action')} x{sell_order.get('quantity')}")
+                    if PAPER_MODE:
+                        _append_paper_signal(order)
+                        logger.info(f"🛡️ [PAPER MODE] 模拟卖出信号落盘: {order.get('code')} x{order.get('quantity')}")
+                    else:
+                        socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
+                        logger.info(f"[卖出广播] {sell_order.get('code')} {sell_order.get('action')} x{sell_order.get('quantity')}")
                 except Exception as e:
                     logger.error(f"[广播异常] 卖出信号发送失败: {e}")
             time.sleep(60)
@@ -355,7 +377,33 @@ def run_brain_node():
                 logger.warning(f"[风控预警] 行情源状态为 {health_status}，禁止生成任何 BUY 信号！")
                 buy_candidates = []
             else:
-                buy_candidates = select_stocks(daily_quotes, portfolio.get("positions", {}), config, _stock_history, market_provider=market_provider)
+                if PAPER_MODE:
+                    picks_file = os.path.join(PROJECT_ROOT, "data_cache", "potential_picks.json")
+                    if os.path.exists(picks_file):
+                        try:
+                            with open(picks_file, "r", encoding="utf-8") as pf:
+                                picks_data = json.load(pf)
+                                for pick in picks_data.get("picks", []):
+                                    f_score = pick.get("fusion_score", 0)
+                                    risk_tags = pick.get("risk_tags", [])
+                                    # 针对可能缺失 fusion_score 的历史数据，提供容错
+                                    if f_score >= 60 or pick.get("priority") == "High" or pick.get("watch_priority") == "High":
+                                        if "致命" not in str(risk_tags):
+                                            buy_candidates.append({
+                                                "code": pick["code"],
+                                                "price": pick.get("last_price", 0),
+                                                "reason": f"Paper Pick (Fusion: {f_score})",
+                                                "strategy": "ai_fusion"
+                                            })
+                        except Exception as e:
+                            logger.error(f"[PaperMode] 读取潜力股失败: {e}")
+                    # 补齐最新行情价格
+                    for c in buy_candidates:
+                        q = [x for x in daily_quotes if x.get("code") == c["code"]]
+                        if q:
+                            c["price"] = q[0].get("lastPrice", q[0].get("price", 0))
+                else:
+                    buy_candidates = select_stocks(daily_quotes, portfolio.get("positions", {}), config, _stock_history, market_provider=market_provider)
             logger.info(f"[选股] 候选买入标的: {len(buy_candidates)} 只")
         except Exception as e:
             logger.error(f"[选股异常] {e}")
@@ -390,13 +438,17 @@ def run_brain_node():
             logger.warning(f"[网格异常] {e}")
 
         # ==========================================
-        # 7. 广播卖出信号
+        # 7. 广播或落盘卖出信号
         # ==========================================
         for sell_order in sell_signals:
             try:
                 order = _serialize_order(sell_order)
-                socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
-                logger.info(f"[卖出广播] {sell_order.get('code')} x{sell_order.get('quantity')}")
+                if PAPER_MODE:
+                    _append_paper_signal(order)
+                    logger.info(f"🛡️ [PAPER MODE] 模拟卖出信号落盘: {sell_order.get('code')} x{sell_order.get('quantity')}")
+                else:
+                    socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
+                    logger.info(f"[卖出广播] {sell_order.get('code')} x{sell_order.get('quantity')}")
             except Exception as e:
                 logger.error(f"[广播异常] {e}")
 
@@ -467,8 +519,13 @@ def run_brain_node():
                     }
                     
                     order = _serialize_order(order)
-                    socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
-                    logger.info(f"[买入广播] {code} x{final_qty} @ {order['price']:.2f}")
+                    
+                    if PAPER_MODE:
+                        _append_paper_signal(order)
+                        logger.info(f"🛡️ [PAPER MODE] 模拟买入信号落盘: {code} x{final_qty} @ {order['price']:.2f}")
+                    else:
+                        socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
+                        logger.info(f"[买入广播] {code} x{final_qty} @ {order['price']:.2f}")
                     
                     if candidate.get("strategy") == "dca":
                         _set_dca_lock(code)
@@ -477,12 +534,16 @@ def run_brain_node():
                     logger.error(f"[买入异常] {code}: {e}")
 
         # ==========================================
-        # 9. 网格订单广播
+        # 9. 网格订单处理
         # ==========================================
         for grid_order in grid_orders:
             try:
                 order = _serialize_order(grid_order)
-                socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
+                if PAPER_MODE:
+                    _append_paper_signal(order)
+                    logger.info(f"🛡️ [PAPER MODE] 模拟网格信号落盘: {order.get('code')} {order.get('action')} x{order.get('quantity')}")
+                else:
+                    socket.send_string(f"TRADE_SIGNAL {json.dumps(order)}")
             except Exception as e:
                 logger.error(f"[网格广播异常] {e}")
 
