@@ -1,3 +1,4 @@
+from core.utils import retry_with_backoff
 import json
 import os
 import re
@@ -10,6 +11,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from core.logger_config import logger
+from core.utils import retry_with_backoff
 
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:8080")
 
@@ -29,6 +31,7 @@ _HOT_SECTOR_MAP = {
     "地产":      ["房地产","地产","楼市","限购","保交楼"],
 }
 
+@retry_with_backoff()
 def fetch_layer1_em_akshare(hours=24):
     """Layer-1: 东方财富 AkShare stock_info_global_em"""
     try:
@@ -74,8 +77,9 @@ def fetch_layer1_em_akshare(hours=24):
                     news_time = datetime.strptime(create_time, "%Y-%m-%d %H:%M:%S")
                     if news_time < cutoff_time:
                         continue
-                except Exception:
-                    pass
+                except Exception as e:
+                    import traceback
+                    logger.warning(f"[NEWS] 解析异常: {e}\n{traceback.format_exc()}")
                     
                 title_text = str(row[title_col]) if title_col else ""
                 digest_text = str(row[digest_col]) if digest_col else ""
@@ -91,8 +95,9 @@ def fetch_layer1_em_akshare(hours=24):
                         "time": create_time,
                         "content": content[:300]
                     })
-            except Exception:
-                pass
+            except Exception as e:
+                import traceback
+                logger.warning(f"[NEWS] 解析异常: {e}\n{traceback.format_exc()}")
         
         logger.info(f"[NEWS-L1] 获取到 {len(filtered_news)} 条数据")
         return filtered_news if filtered_news else None
@@ -100,6 +105,7 @@ def fetch_layer1_em_akshare(hours=24):
         logger.exception(f"[NEWS-L1] AkShare 获取失败: {e}")
         return None
 
+@retry_with_backoff()
 def fetch_layer2_em_http(hours=24):
     """Layer-2: 东方财富 Kuaixun HTTP 直连"""
     url = "https://np-listapi.eastmoney.com/comm/web/getFastNewsList"
@@ -138,8 +144,9 @@ def fetch_layer2_em_http(hours=24):
                     news_time = datetime.strptime(create_time, "%Y-%m-%d %H:%M:%S")
                     if news_time < cutoff_time:
                         continue
-            except Exception:
-                pass
+            except Exception as e:
+                import traceback
+                logger.warning(f"[NEWS] 解析异常: {e}\n{traceback.format_exc()}")
 
             content = re.sub(r"<[^>]+>", "", content).strip()
             if content:
@@ -154,6 +161,7 @@ def fetch_layer2_em_http(hours=24):
         logger.exception(f"[NEWS-L2] 东财 HTTP 获取失败: {e}")
         return None
 
+@retry_with_backoff()
 def fetch_layer3_sina_7x24(hours=24, limit_pages=5):
     """Layer-3: 新浪 7x24，支持翻页"""
     url = "https://zhibo.sina.com.cn/api/zhibo/feed"
@@ -196,7 +204,9 @@ def fetch_layer3_sina_7x24(hours=24, limit_pages=5):
                                 "time": create_time,
                                 "content": content
                             })
-                except Exception:
+                except Exception as e:
+                    import traceback
+                    logger.warning(f"[NEWS] 解析异常: {e}\n{traceback.format_exc()}")
                     continue
                     
             if all_stale:
@@ -231,15 +241,17 @@ def _check_llm_alive(timeout=5):
         res = requests.get(f"{LLM_BASE_URL}/health", timeout=timeout)
         if res.status_code == 200:
             return True
-    except:
-        pass
+    except Exception as e:
+        import traceback
+        logger.warning(f"[NEWS] 异常: {e}\n{traceback.format_exc()}")
         
     try:
         res = requests.get(f"{LLM_BASE_URL}/v1/models", timeout=timeout)
         if res.status_code == 200:
             return True
-    except:
-        pass
+    except Exception as e:
+        import traceback
+        logger.warning(f"[NEWS] 异常: {e}\n{traceback.format_exc()}")
         
     return False
 
@@ -393,12 +405,13 @@ def get_news_sentiment(hours=24):
     news_list, source = fetch_news_waterfall(hours)
     
     if not news_list:
-        fallback_watchlist = os.environ.get("NEWS_FALLBACK_WATCHLIST", "sh600519,sh000001").split(",")
+        _source_flag = "DATA_UNAVAILABLE" if source == "ALL_FAILED" else "NO_NEWS"
+        logger.warning(f"[NEWS_EXTRACTOR] 无法获取资讯或资讯为空，状态={_source_flag}。")
         return {
             "macro_sentiment": 0,
             "hot_sectors": [],
-            "risk_warnings": fallback_watchlist,
-            "_source": source if source == "ALL_FAILED" else "empty_news",
+            "risk_warnings": [],
+            "_source": _source_flag,
             "_news_count": 0
         }
         

@@ -245,6 +245,40 @@ def sidebar_status_panel():
             st.rerun()
     
     # 战术指令流刷新按钮
+    # ===== 行情数据源健康状态 =====
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🌐 行情源监控")
+    health_file = CACHE_DIR / "market_health.json"
+    if health_file.exists():
+        try:
+            with open(health_file, "r", encoding="utf-8") as f:
+                health = json.load(f)
+            
+            provider = health.get("provider", "Unknown")
+            ts = health.get("timestamp", 0)
+            status = health.get("status", "DOWN")
+            
+            delay = time.time() - ts
+            
+            if delay > 300: # 5分钟未更新视为严重延迟
+                status_color = "🔴"
+                status_text = "STALE"
+            elif status == "OK":
+                status_color = "🟢"
+                status_text = "OK"
+            else:
+                status_color = "🔴"
+                status_text = status
+                
+            st.sidebar.markdown(f"**主数据源**: {provider}")
+            st.sidebar.markdown(f"**状态**: {status_color} {status_text}")
+            st.sidebar.markdown(f"**延迟**: {delay:.1f} 秒")
+            st.sidebar.markdown(f"**最后更新**: {health.get('datetime', 'N/A')}")
+        except Exception:
+            st.sidebar.error("读取行情健康状态失败")
+    else:
+        st.sidebar.warning("等待行情源初始化...")
+
     st.sidebar.markdown("---")
     st.sidebar.markdown("**📡 战术指令流控制**")
     if st.sidebar.button("🔄 获取最新战术指令", width="stretch"):
@@ -545,6 +579,87 @@ def _render_top_metrics_fragment():
         current_state = get_trading_state()
         st.metric("ZMQ 总线", f"ACTIVE ({current_state})")
 
+
+def _render_system_health_check_fragment():
+    st.subheader("🏥 系统健康度探针 (Health Check)")
+    
+    # 1. LLM 通道状态
+    import requests
+    llm_status = "🔴 离线"
+    llm_latency = "N/A"
+    try:
+        t0 = time.time()
+        res = requests.get('http://localhost:11434/api/tags', timeout=1.0)
+        if res.status_code == 200:
+            llm_latency = f"{(time.time() - t0)*1000:.0f}ms"
+            llm_status = "🟢 可用"
+    except:
+        pass
+        
+    # 2. 数据源新鲜度
+    def get_file_freshness(filename):
+        filepath = CACHE_DIR / filename
+        if not filepath.exists():
+            return "🔴 缺失", 99999
+        mtime = filepath.stat().st_mtime
+        delay_mins = (time.time() - mtime) / 60
+        status = "🟢 新鲜" if delay_mins < 30 else "🔴 严重延迟"
+        return status, delay_mins
+        
+    l1_stat, l1_del = get_file_freshness("news_layer1.json")
+    l2_stat, l2_del = get_file_freshness("news_layer2.json")
+    l3_stat, l3_del = get_file_freshness("news_layer3.json")
+    
+    # 3. 对账状态灯 & 心跳
+    hb_file = CACHE_DIR / "heartbeats.json"
+    hb_data = load_json(hb_file, {})
+    now = time.time()
+    
+    trader_hb = hb_data.get("live_trader", 0)
+    trader_delay = now - trader_hb
+    trader_status = "🟢 正常" if trader_delay < 300 and trader_hb > 0 else "🔴 疑似失联"
+    
+    brain_hb = hb_data.get("brain_node", 0)
+    brain_delay = now - brain_hb
+    brain_status = "🟢 正常" if brain_delay < 300 and brain_hb > 0 else "🔴 疑似失联"
+    
+    # 4. 整体状态机
+    try:
+        from core.trading_state import get_trading_state, TradingState
+        t_state = get_trading_state()
+        state_color = "green" if t_state == TradingState.ACTIVE.value else "red"
+        state_html = f"<b style='color:{state_color}'>{t_state}</b>"
+    except:
+        state_html = "未知"
+        t_state = "UNKNOWN"
+        
+    # UI Render
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.info(f"**🧠 LLM 状态**\n\n状态: {llm_status}\n\n延迟: {llm_latency}")
+    with c2:
+        st.info(f"**📰 资讯通道延迟**\n\nL1: {l1_stat} ({l1_del:.0f}m)\n\nL2: {l2_stat} ({l2_del:.0f}m)\n\nL3: {l3_stat} ({l3_del:.0f}m)")
+    with c3:
+        st.info(f"**💓 核心模块心跳**\n\nTrader: {trader_status} ({trader_delay:.0f}s)\n\nBrain: {brain_status} ({brain_delay:.0f}s)")
+    with c4:
+        st.info(f"**⚙️ 全局交易状态机**\n\n当前状态: {state_html}")
+        if t_state in ("FROZEN", "DEGRADED", "EMERGENCY"):
+            # 尝试提取最后一行错误日志
+            log_file = CACHE_DIR.parent / "logs" / "app.log"
+            last_err = ""
+            if log_file.exists():
+                try:
+                    lines = open(log_file, "r", encoding="utf-8").readlines()
+                    errs = [l for l in lines if "ERROR" in l or "CRITICAL" in l]
+                    if errs:
+                        last_err = errs[-1].strip()[-80:] # 取最后80字符
+                except:
+                    pass
+            if last_err:
+                st.caption(f"⚠️ {last_err}")
+                
+    st.markdown("---")
+
 def module_portfolio_dashboard():
     """模块 1：资产监控大屏（企业级重构版）"""
     _render_risk_canopy_and_kill_switch()
@@ -565,6 +680,8 @@ def module_portfolio_dashboard():
                     st.error("❌ 同步失败")
 
     st.markdown("---")
+    
+    _render_system_health_check_fragment()
 
     _render_top_metrics_fragment()
 

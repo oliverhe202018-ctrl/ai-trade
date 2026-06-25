@@ -121,3 +121,10 @@ notify:
 
 # ==================== Cron 轮询 (秒) ====================
 poll_interval: 300
+
+
+market_data:
+  primary_provider: "qmt"
+  max_delay_seconds: 5
+  freeze_on_stale_data: true
+  allow_fallback_for_research_only: false

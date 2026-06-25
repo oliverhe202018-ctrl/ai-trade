@@ -9,22 +9,24 @@ CACHE_DIR.mkdir(exist_ok=True)
 STATE_FILE = CACHE_DIR / "system_state.json"
 
 class TradingState(Enum):
-    RUNNING = "RUNNING"
+    ACTIVE = "ACTIVE"
+    DEGRADED = "DEGRADED"
+    RECOVERING = "RECOVERING"
     PAUSED = "PAUSED"
     FROZEN = "FROZEN"
     EMERGENCY = "EMERGENCY"
 
 def get_trading_state() -> str:
-    """获取系统风控状态，默认为 RUNNING"""
+    """获取系统风控状态，默认为 ACTIVE"""
     if not STATE_FILE.exists():
-        return TradingState.RUNNING.value
+        return TradingState.ACTIVE.value
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return data.get("state", TradingState.RUNNING.value)
+            return data.get("state", TradingState.ACTIVE.value)
     except Exception as e:
         logger.error(f"读取全局风控状态失败: {e}")
-        return TradingState.RUNNING.value
+        return TradingState.ACTIVE.value
 
 def set_trading_state(state: TradingState):
     """持久化系统风控状态"""

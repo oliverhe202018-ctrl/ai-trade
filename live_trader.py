@@ -26,9 +26,21 @@ except Exception as _e:
     print(f"[DOTENV_ERROR] .env 加载异常，继续运行: {_e}")
 
 from core.logger_config import logger
+from core.utils import retry_with_backoff
 from core.state_manager import load_portfolio, save_portfolio
 from core.broker_adapter import MockBrokerAdapter, BaseBroker
 from core.order_manager import OrderManager
+import traceback
+from core.trading_state import set_trading_state, TradingState
+from feeds.qmt_market_provider import QMTMarketProvider
+
+try:
+    market_provider = QMTMarketProvider()
+except Exception as e:
+    logger.critical(f"行情通道初始化失败，系统启动降级！{e}")
+    set_trading_state(TradingState.FROZEN)
+    market_provider = None
+
 from core.backtester import CACHE_DIR, download_historical_data
 from core.trading_state import get_trading_state, set_trading_state, TradingState
 
@@ -69,6 +81,11 @@ ORDER_SCHEMA = {
 _reconcile_fail_count = 0
 _RECONCILE_FAIL_THRESHOLD = 5
 
+
+
+@retry_with_backoff()
+def safe_place_order(broker_instance, order_dict):
+    return broker_instance.place_order(order_dict)
 
 def validate_order(order: dict) -> bool:
     """校验订单格式合法性"""
@@ -124,8 +141,40 @@ def phase_daily_settlement():
     logger.info("[SETTLEMENT] 日终结算完成。")
 
 
+
+# --- WATCHDOG HEARTBEAT ---
+def _update_heartbeat():
+    import json, os, time
+    from filelock import FileLock
+    hb_file = os.path.join(PROJECT_ROOT, "data_cache", "heartbeats.json")
+    lock_file = hb_file + ".lock"
+    os.makedirs(os.path.dirname(hb_file), exist_ok=True)
+    try:
+        from filelock import FileLock
+        with FileLock(lock_file, timeout=2):
+            data = dict()
+            if os.path.exists(hb_file):
+                try:
+                    with open(hb_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except:
+                    pass
+            data["live_trader"] = time.time()
+            with open(hb_file, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+    except Exception as e:
+        from core.logger_config import logger
+        logger.warning(f"[HEARTBEAT_FAIL] 无法写入心跳文件: {e}")
+# --------------------------
+
+
+# --- TWAP 队列 ---
+# 格式: [{"execute_at": 169xxxxxxx, "order": {...}}, ...]
+_twap_queue = []
+
 def run_live_trader():
     global _reconcile_fail_count
+    global _twap_queue
 
     context = zmq.Context()
     socket = context.socket(zmq.SUB)
@@ -137,6 +186,7 @@ def run_live_trader():
 
     while True:
         now = datetime.now()
+        _update_heartbeat()
 
         # 15:05 日终结算（每日一次）
         if now.hour == 15 and now.minute >= 5 and not settlement_done_today:
@@ -146,29 +196,39 @@ def run_live_trader():
         if now.hour == 9 and now.minute < 25:
             settlement_done_today = False  # 重置当日结算标志
 
+        # ── 执行 TWAP 队列 ──
+        now_ts = time.time()
+        ready_orders = [o for o in _twap_queue if o["execute_at"] <= now_ts]
+        _twap_queue = [o for o in _twap_queue if o["execute_at"] > now_ts]
+        
+        for twap_item in ready_orders:
+            order = twap_item["order"]
+            logger.info(f"[TWAP_EXEC] 执行拆单: {order['code']} {order['action']} qty={order['quantity']}")
+            try:
+                result = safe_place_order(broker, order)
+                order_manager.track_order(result)
+                logger.info(f"[TRADE_TRACE] code={order.get('code')} action={order.get('action')} qty={order.get('quantity')} result={result}")
+            except Exception as e:
+                logger.error(f"[ORDER_EXEC_FAIL] TWAP 下单失败: {e} | order={order}")
+
         # ── 对账循环 ──
+        current_state = get_trading_state()
         try:
             order_manager.sync_orders()
             _reconcile_fail_count = 0
-        except KeyError as e:
-            _reconcile_fail_count += 1
-            logger.error(
-                f"[OrderManager] 对账异常: {e!r} "
-                f"({_reconcile_fail_count}/{_RECONCILE_FAIL_THRESHOLD})"
-            )
-            if _reconcile_fail_count >= _RECONCILE_FAIL_THRESHOLD:
-                logger.critical("[CIRCUIT_BREAKER] 对账连续失败，触发 FROZEN 状态！")
-                set_trading_state(TradingState.FROZEN)
-                _reconcile_fail_count = 0
+            if current_state in (TradingState.FROZEN.value, TradingState.DEGRADED.value, TradingState.RECOVERING.value):
+                logger.info(f"[STATE_TRANSITION] 对账恢复成功，从 {current_state} 恢复为 ACTIVE。")
+                set_trading_state(TradingState.ACTIVE)
         except Exception as e:
             _reconcile_fail_count += 1
             logger.error(
-                f"[OrderManager] 对账未知异常: {e!r} "
+                f"[OrderManager] 对账异常: {repr(e)} "
                 f"({_reconcile_fail_count}/{_RECONCILE_FAIL_THRESHOLD})"
             )
             if _reconcile_fail_count >= _RECONCILE_FAIL_THRESHOLD:
-                logger.critical("[CIRCUIT_BREAKER] 对账连续失败，触发 FROZEN 状态！")
-                set_trading_state(TradingState.FROZEN)
+                if current_state != TradingState.FROZEN.value:
+                    logger.critical(f"[STATE_TRANSITION] 对账连续失败，从 {current_state} 降级为 FROZEN！")
+                    set_trading_state(TradingState.FROZEN)
                 _reconcile_fail_count = 0
 
         # ── 接收交易信号 ──
@@ -181,18 +241,75 @@ def run_live_trader():
                 continue
 
             trading_state = get_trading_state()
-            if trading_state != TradingState.ACTIVE:
-                logger.warning(
-                    f"[TRADING_STATE_UNAVAILABLE] 状态={trading_state}，"
-                    f"信号 {order.get('code')} {order.get('action')} 被阻断。"
-                )
-                continue
+            if trading_state != TradingState.ACTIVE.value:
+                if order.get('action') == 'SELL' and trading_state == TradingState.FROZEN.value:
+                    logger.warning(f"[FAIL_CLOSE] 状态={trading_state}，但允许安全退出：放行 {order.get('code')} SELL。")
+                else:
+                    logger.warning(
+                        f"[TRADING_STATE_UNAVAILABLE] 状态={trading_state}，"
+                        f"信号 {order.get('code')} {order.get('action')} 被阻断。"
+                    )
+                    continue
 
             asset_data = get_asset_data_mock_safe()
-            logger.info(f"[ORDER_EXEC] 执行: {order} | 可用资金={asset_data.get('cash', 0):.2f}")
+            cash = asset_data.get('cash', 0)
+            
+            stale_count = getattr(run_live_trader, "stale_count", 0)
+            if market_provider and order.get("action") == "BUY":
+                is_fresh = market_provider.is_data_fresh(order['code'], max_delay_seconds=5)
+                if not is_fresh:
+                    stale_count += 1
+                    run_live_trader.stale_count = stale_count
+                    logger.warning(f"[{order['code']}] 行情数据滞后或无法获取，取消本次下单 (stale_count: {stale_count})")
+                    if stale_count >= 5:
+                        logger.critical("行情连续 5 次滞后，触发系统降级 -> FROZEN")
+                        set_trading_state(TradingState.FROZEN)
+                    continue
+                else:
+                    run_live_trader.stale_count = 0
+
+            # TWAP 拆单判断：订单金额 > 可用资金 10%
+            order_amount = order.get('price', 0) * order.get('quantity', 0)
+            if cash > 0 and order_amount > cash * 0.1 and order.get('quantity', 0) >= 300:
+                if market_provider:
+                    try:
+                        ob = market_provider.get_orderbook(order['code'])
+                        ask_price = ob.get("askPrice", [0])[0] if ob.get("askPrice") else 0
+                        ask_vol = ob.get("askVol", [0])[0] if ob.get("askVol") else 0
+                        bid_price = ob.get("bidPrice", [0])[0] if ob.get("bidPrice") else 0
+                        bid_vol = ob.get("bidVol", [0])[0] if ob.get("bidVol") else 0
+                        top_amount = (ask_price * ask_vol * 100) + (bid_price * bid_vol * 100)
+                        if top_amount > 0 and top_amount < 500000:
+                            logger.warning(f"[TWAP_CANCEL] {order['code']} 实时盘口深度差 (一档总额 {top_amount:.0f})，取消拆单执行！")
+                            continue
+                    except Exception as e:
+                        logger.error(f"[TWAP_CANCEL] 盘口获取失败: {e}")
+                        continue
+                
+                import random
+                split_count = random.randint(3, 5)
+                base_qty = (order['quantity'] // split_count) // 100 * 100
+                if base_qty >= 100:
+                    logger.info(f"[TWAP_SPLIT] 订单金额 {order_amount:.0f} > 10% 可用资金({cash:.0f})，启用 TWAP 拆分为 {split_count} 笔")
+                    remaining_qty = order['quantity']
+                    for i in range(split_count):
+                        qty = base_qty if i < split_count - 1 else remaining_qty
+                        if qty <= 0: continue
+                        split_order = order.copy()
+                        split_order['quantity'] = qty
+                        # 间隔 30-90 秒
+                        delay = i * random.randint(30, 90)
+                        _twap_queue.append({
+                            "execute_at": time.time() + delay,
+                            "order": split_order
+                        })
+                        remaining_qty -= qty
+                    continue
+
+            logger.info(f"[ORDER_EXEC] 执行: {order} | 可用资金={cash:.2f}")
 
             try:
-                result = broker.place_order(order)
+                result = safe_place_order(broker, order)
                 order_manager.track_order(result)
                 logger.info(
                     f"[TRADE_TRACE] code={order.get('code')} action={order.get('action')} "

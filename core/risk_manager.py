@@ -18,9 +18,12 @@ def _load_hyperparams():
             logger.error(f"[风控层] hyperparams.json 解析失败: {e}")
     return {}
 
-def calculate_atr(data, period=14):
+def calculate_atr(data, period=20):
     """计算真实波动幅度 (ATR)"""
-    highs, lows, closes = data.get("highs", []), data.get("lows", []), data.get("closes", [])
+    try:
+        highs, lows, closes = data["high"].tolist(), data["low"].tolist(), data["close"].tolist()
+    except Exception:
+        highs, lows, closes = data.get("highs", []), data.get("lows", []), data.get("closes", [])
     if len(closes) < period + 1:
         return 0
     tr_list = []

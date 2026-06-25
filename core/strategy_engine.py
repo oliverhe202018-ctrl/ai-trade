@@ -71,12 +71,138 @@ def _get_market_filter():
     return _market_filter
 
 
-def select_stocks(quotes, positions, config, mode="mock"):
+def _liquidity_filter(candidates: list) -> list:
+    """
+    P1 流动性底线过滤器
+    目的：剔除换手率极低、盘口无深度、散户特征明显的标的。
+    约束：不直接生成买入信号，仅做淘汰过滤，并记录日志。
+    如果行情 API 不可用，返回原始 candidates。
+    """
+    if not candidates:
+        return candidates
+
+    try:
+        from xtquant import xtdata
+    except ImportError:
+        logger.warning("[LIQUIDITY_FILTER] xtquant 未安装，跳过流动性过滤。")
+        return candidates
+
+    # 提取 QMT 格式的代码列表
+    code_map = {}
+    for c in candidates:
+        prefix = c.get("code", "")[:2]
+        code_num = c.get("code", "")[2:]
+        if prefix == "sh":
+            qmt_code = f"{code_num}.SH"
+        elif prefix == "sz":
+            qmt_code = f"{code_num}.SZ"
+        else:
+            continue
+        code_map[qmt_code] = c
+
+    if not code_map:
+        return candidates
+
+    try:
+        qmt_codes = list(code_map.keys())
+        for c in qmt_codes:
+            xtdata.subscribe_quote(c, period='1d', start_time='', end_time='', count=0, callback=None)
+            
+        ticks = xtdata.get_full_tick(qmt_codes)
+        
+        filtered_candidates = []
+        for qmt_code, c in code_map.items():
+            # 条件1: 换手率 < 1%
+            turnover = c.get("turnover_rate", 0.0)
+            if turnover > 0 and turnover < 1.0:
+                logger.info(f"[流动性过滤] 剔除 {c['code']} ({c.get('name', '')}): 换手率 {turnover}% 低于 1%")
+                continue
+                
+            tick = ticks.get(qmt_code)
+            if not tick:
+                filtered_candidates.append(c)
+                continue
+                
+            # 条件2: 买卖一档金额之和 < 50w
+            ask_price = tick.get("askPrice", [0])[0]
+            ask_vol = tick.get("askVol", [0])[0]
+            bid_price = tick.get("bidPrice", [0])[0]
+            bid_vol = tick.get("bidVol", [0])[0]
+            
+            top_level_amount = (ask_price * ask_vol * 100) + (bid_price * bid_vol * 100)
+            if top_level_amount < 500000:
+                logger.info(f"[流动性过滤] 剔除 {c['code']} ({c.get('name', '')}): 盘口一档总挂单金额 {top_level_amount:.0f} < 50万")
+                continue
+                
+            filtered_candidates.append(c)
+            
+        return filtered_candidates
+    except Exception as e:
+        logger.warning(f"[LIQUIDITY_FILTER] 流动性检查失败，保守放行: {e}")
+        return candidates
+
+
+
+def _check_technical_resonance(code, stock_history):
+    """
+    P1 技术面共振过滤:
+    检查 RSI(14) 处于 30-50 且 MACD 零轴上方金叉或红柱放大
+    """
+    if not stock_history:
+        return True, "未传入历史数据"
+        
+    hist_df = stock_history.get(code)
+    if hist_df is None or len(hist_df) < 30:
+        return True, "无足够历史数据，保守放行"
+        
+    try:
+        import pandas as pd
+        closes = hist_df['close']
+        
+        # 计算 RSI(14)
+        delta = closes.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        current_rsi = rsi.iloc[-1]
+        
+        if not (30 <= current_rsi <= 50):
+            return False, f"RSI({current_rsi:.1f}) 不在 30-50 强势回调区间"
+            
+        # 计算 MACD (12, 26, 9)
+        exp1 = closes.ewm(span=12, adjust=False).mean()
+        exp2 = closes.ewm(span=26, adjust=False).mean()
+        macd = exp1 - exp2
+        signal = macd.ewm(span=9, adjust=False).mean()
+        
+        current_macd = macd.iloc[-1]
+        prev_macd = macd.iloc[-2]
+        current_signal = signal.iloc[-1]
+        prev_signal = signal.iloc[-2]
+        
+        # MACD 零轴上方金叉 或 红柱放大
+        is_golden_cross = prev_macd <= prev_signal and current_macd > current_signal
+        is_red_expanding = current_macd > current_signal and (current_macd - current_signal) > (prev_macd - prev_signal)
+        
+        if current_macd < 0:
+            return False, "MACD 处于零轴下方，非多头排列"
+            
+        if not (is_golden_cross or is_red_expanding):
+            return False, "MACD 非金叉且红柱未放大"
+            
+        return True, "RSI/MACD 多头共振"
+    except Exception as e:
+        return True, f"技术指标计算异常，保守放行: {e}"
+
+
+def select_stocks(quotes, positions, config, stock_history=None, market_provider=None, mode="mock"):
     """
     选股流水线编排（v5 增强版）
 
     流程:
         1. 涨跌停硬过滤 → 基础粗筛
+        1.5 流动性底线过滤
         2. 资金/仓位统计 → 可用资金计算
         3. AI 通信模块 → 分批轮询打分过滤
         4. 策略路由 → 分发到对应策略算法模块
@@ -96,6 +222,9 @@ def select_stocks(quotes, positions, config, mode="mock"):
 
     # 1. 基础硬编码粗筛 — 排除涨跌停
     candidates = [q for q in quotes if not (q.get("limit_up") or q.get("limit_down"))]
+    
+    # 1.5 流动性底线过滤 (TODO)
+    candidates = _liquidity_filter(candidates)
 
     # 2. 资金流水统计
     initial_capital = config.get("initial_capital", 50000)
@@ -187,6 +316,19 @@ def select_stocks(quotes, positions, config, mode="mock"):
         rejected = original_count - len(candidates)
         if rejected > 0:
             logger.info(f"  [AI门槛过滤] score<70 拦截 {rejected} 只平庸标的，剩余候选 {len(candidates)} 只")
+
+    # ===== 技术面多头共振检查 =====
+    if candidates and stock_history:
+        tech_filtered = []
+        for c in candidates:
+            code = c.get("code")
+            passed, reason = _check_technical_resonance(code, stock_history)
+            if passed:
+                tech_filtered.append(c)
+                logger.info(f"  [多头共振通过] {code}: {reason}")
+            else:
+                logger.info(f"  [多头共振拦截] {code}: {reason}")
+        candidates = tech_filtered
 
     if not candidates:
         return {"buys": [], "sells": [], "strategy": strategy_type, "env_regime": "UNKNOWN"}

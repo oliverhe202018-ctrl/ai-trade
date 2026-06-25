@@ -37,7 +37,7 @@ from core.strategy_engine import select_stocks, generate_sell_signals, mean_reve
 from core.risk_manager import calculate_atr, calculate_position_size
 from core.grid_manager import GridManager
 from core.state_manager import load_portfolio
-from core.backtester import download_historical_data, BACKTEST_UNIVERSE
+from core.backtester import BACKTEST_UNIVERSE
 from core.trading_state import get_trading_state, TradingState
 
 LIVE_UNIVERSE = BACKTEST_UNIVERSE
@@ -74,7 +74,8 @@ def _get_index_change_pct_from_cache():
                 _stale_cache_counter += 1
                 logger.warning(f"[INDEX_CACHE_STALE] 大盘缓存文件超过 10 分钟未更新！连续陈旧次数: {_stale_cache_counter}，准备 fallback 到内存缓存")
                 if _stale_cache_counter >= _STALE_CACHE_HALT_THRESHOLD:
-                    logger.error(f"[INDEX_CACHE_HALT] 大盘缓存连续陈旧 {_stale_cache_counter} 次，触发保守熔断！")
+                    logger.error(f"[INDEX_CACHE_HALT] 大盘缓存连续陈旧 {_stale_cache_counter} 次，抛出 CACHE_STALE_ERROR 信号！")
+                    return "CACHE_STALE_ERROR"
                 return None
             _stale_cache_counter = 0
             return cache_data.get("change_pct")
@@ -120,6 +121,85 @@ def _serialize_order(order: dict) -> dict:
     return result
 
 
+
+# --- WATCHDOG HEARTBEAT ---
+def _update_heartbeat():
+    import json, os, time
+    from filelock import FileLock
+    hb_file = os.path.join(PROJECT_ROOT, "data_cache", "heartbeats.json")
+    lock_file = hb_file + ".lock"
+    os.makedirs(os.path.dirname(hb_file), exist_ok=True)
+    try:
+        from filelock import FileLock
+        with FileLock(lock_file, timeout=2):
+            data = dict()
+            if os.path.exists(hb_file):
+                try:
+                    with open(hb_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except:
+                    pass
+            data["brain_node"] = time.time()
+            with open(hb_file, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+    except Exception as e:
+        from core.logger_config import logger
+        logger.warning(f"[HEARTBEAT_FAIL] 无法写入心跳文件: {e}")
+# --------------------------
+
+
+def _check_momentum_resonance(code, candidate, hot_sectors, stock_history):
+    """
+    P1 动量与龙头确认机制
+    属于热门板块的个股必须满足：竞价涨幅>3% 或 早盘成交量>昨日30%
+    """
+    sector = candidate.get("sector", "")
+    if sector not in hot_sectors:
+        return True, "非热门板块独立走势，放行"
+        
+    hist_df = stock_history.get(code)
+    if hist_df is None or len(hist_df) < 2:
+        return False, "缺乏历史数据，无法确认昨日成交量"
+        
+    try:
+        # 获取昨日 volume
+        # hist_df 可能是按日期升序
+        yest_vol = hist_df.iloc[-2].get('volume', 0)
+        if yest_vol <= 0:
+            return False, "昨日成交量为0"
+            
+        if not market_provider:
+            return False, "无行情源，动量确认失败"
+        tick = market_provider.get_realtime_quote(code)
+        if not tick:
+            return False, "无法获取今日快照"
+            
+        today_vol = tick.get("volume", 0)
+        # xtdata doesn't always provide lastClose in our mapped dict (we mapped it to price if lastPrice is missing), so let's check
+        last_close = tick.get("lastClose", tick.get("price", 0.0))
+        open_price = tick.get("open", 0.0)
+        
+        if open_price > 0 and last_close > 0:
+            open_pct = (open_price / last_close - 1) * 100
+            if open_pct > 3.0:
+                return True, f"热门板块前排: 竞价涨幅 {open_pct:.2f}% > 3%"
+                
+        if today_vol > 0.3 * yest_vol:
+            return True, f"热门板块前排: 放量 {today_vol}/{yest_vol} > 30%"
+            
+        return False, "属于热门板块，但无量价共振（跟风标的），拦截"
+    except Exception as e:
+        logger.warning(f"[{code}] 动量确认异常: {e}")
+        return False, "动量检查异常"
+
+from feeds.qmt_market_provider import QMTMarketProvider
+try:
+    market_provider = QMTMarketProvider()
+except Exception as e:
+    logger.critical(f"行情接口初始化失败: {e}")
+    market_provider = None
+
+
 def run_brain_node():
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -131,19 +211,24 @@ def run_brain_node():
     # 历史数据预热（启动时一次性加载，后续增量更新）
     # ===============================================================
     _stock_history = {}
-    logger.info("📡 正在预热历史数据底座...")
-    for code in LIVE_UNIVERSE:
-        try:
-            hist_df, _, _ = download_historical_data(code, days=30)
-            if hist_df is not None and not hist_df.empty:
-                _stock_history[code] = hist_df
-        except Exception as e:
-            logger.warning(f"[预热] {code} 历史数据加载失败: {e}")
-    logger.info(f"✅ 历史底座预热完毕，共加载 {len(_stock_history)} 只标的。")
+    if market_provider:
+        logger.info("📡 正在使用 QMT 预热历史数据底座...")
+        for code in LIVE_UNIVERSE:
+            try:
+                hist_df = market_provider.get_bars(code, period="1d", count=30)
+                import pandas as pd
+                if isinstance(hist_df, pd.DataFrame) and not hist_df.empty:
+                    _stock_history[code] = hist_df
+            except Exception as e:
+                logger.warning(f"[预热] {code} 历史数据加载失败: {e}")
+        logger.info(f"✅ 历史底座预热完毕，共加载 {len(_stock_history)} 只标的。")
+    else:
+        logger.error("❌ 无可用行情源，跳过历史预热。")
     # ===============================================================
 
     while True:
         now = datetime.now()
+        _update_heartbeat()
         # 仅在盘中交易时段进行 AI 轮询 (9:30-11:30, 13:00-15:00)
         is_trading_time = (now.hour == 9 and now.minute >= 30) or (now.hour == 10) or (now.hour == 11 and now.minute <= 30) or (13 <= now.hour < 15)
         
@@ -188,54 +273,58 @@ def run_brain_node():
         
         try:
             index_change_pct = _get_index_change_pct_from_cache()
-            if index_change_pct is not None:
+            if index_change_pct == "CACHE_STALE_ERROR":
+                systemic_risk_halt = True
+                logger.error("🚨 [风控拦截] [INDEX_CACHE_STALE] 由于缓存陈旧达到阈值，主动拒绝买入！")
+                _last_index_change_pct = "CACHE_STALE_ERROR"
+            elif index_change_pct is not None:
                 _last_index_change_pct = index_change_pct
             else:
                 # 缓存为空或超过5分钟，fallback 到内存缓存
-                if _last_index_change_pct is None:
-                    # 内存缓存也为空，默认进入中性模式 (0.0)，防止误触发熔断
-                    logger.warning("[INDEX_CACHE_MISSING] 大盘缓存与内存缓存均为空，默认进入中性模式，不触发熔断！")
+                if _last_index_change_pct in (None, "CACHE_STALE_ERROR"):
+                    # 内存缓存也为空或失效，默认进入中性模式 (0.0)，防止误触发熔断
+                    logger.warning("[INDEX_CACHE_MISSING] 大盘缓存与内存缓存均为空或已失效，默认进入中性模式，不触发熔断！")
                     _last_index_change_pct = 0.0
                     
-            if _last_index_change_pct <= -2.5:
+            if isinstance(_last_index_change_pct, (int, float)) and _last_index_change_pct <= -2.5:
                 systemic_risk_halt = True
                 logger.error(f"🚨 [风控拦截] 上证指数跌幅 {_last_index_change_pct}% <= -2.5%，触发全局系统性风险规避，本轮禁止买入！")
         except Exception as e:
             logger.warning(f"[风控预警] 大盘检测逻辑异常，保守拦截: {e}")
             systemic_risk_halt = True
 
-        # 2. 获取实时行情 - ThreadPoolExecutor 并发拉取
+        # 2. 获取实时行情 - QMT 统一快照
         daily_quotes = []
-        import concurrent.futures
-        import random
-
-        def fetch_one(code):
-            try:
-                # 批次内的轻量随机抖动，防封杀 (0.1s ~ 0.3s)
-                time.sleep(random.uniform(0.1, 0.3))
-                _, quotes, _ = download_historical_data(code, days=1)
-                return quotes
-            except Exception as e:
-                logger.warning(f"[行情拉取] {code} 失败: {e}")
-                return []
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-            futures = {executor.submit(fetch_one, code): code for code in LIVE_UNIVERSE}
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                if result:
-                    daily_quotes.extend(result)
-        
+        try:
+            if market_provider:
+                snapshots = market_provider.get_market_snapshot(LIVE_UNIVERSE)
+                daily_quotes = list(snapshots.values())
+            else:
+                logger.error("行情接口异常，无法获取实时切片。")
+        except Exception as e:
+            logger.error(f"[获取行情异常] {e}")
+            
+        # === 写入行情源健康状态 ===
+        health_data = {}
+        try:
+            if market_provider:
+                health_data = market_provider.health_check()
+                with open(os.path.join(PROJECT_ROOT, "data_cache", "market_health.json"), "w", encoding="utf-8") as f:
+                    json.dump(health_data, f)
+        except Exception as e:
+            logger.error(f"写入行情健康状态失败: {e}")
+            
         logger.info(f"📡 本轮拉取到 {len(daily_quotes)} 条行情记录")
 
         # ==========================================
         # 3. 交易状态校验 — Fail-close
         # ==========================================
         trading_state = get_trading_state()
-        if trading_state != TradingState.ACTIVE:
+        if trading_state != TradingState.ACTIVE.value:
             logger.warning(f"[TRADING_STATE_UNAVAILABLE] 当前交易状态: {trading_state}，禁止买入，直接进入卖出检查。")
             # 即使状态异常，仍然允许卖出已持仓的风险标的
-            sell_signals = generate_sell_signals(portfolio, daily_quotes, _stock_history)
+            config = {"initial_capital": 100000, "max_positions": 10, "strategy": {"type": "trend"}}
+            sell_signals = generate_sell_signals(portfolio.get("positions", {}), daily_quotes, config)
             for sell_order in sell_signals:
                 try:
                     order = _serialize_order(sell_order)
@@ -253,13 +342,21 @@ def run_brain_node():
         sell_signals = []
 
         try:
-            buy_candidates = select_stocks(portfolio, daily_quotes, _stock_history)
+            config = {"initial_capital": 100000, "max_positions": 10, "strategy": {"type": "trend"}}
+            
+            health_status = health_data.get("status", "DOWN")
+            if health_status in ["STALE", "DOWN"]:
+                logger.warning(f"[风控预警] 行情源状态为 {health_status}，禁止生成任何 BUY 信号！")
+                buy_candidates = []
+            else:
+                buy_candidates = select_stocks(daily_quotes, portfolio.get("positions", {}), config, _stock_history, market_provider=market_provider)
             logger.info(f"[选股] 候选买入标的: {len(buy_candidates)} 只")
         except Exception as e:
             logger.error(f"[选股异常] {e}")
 
         try:
-            sell_signals = generate_sell_signals(portfolio, daily_quotes, _stock_history)
+            config = {"initial_capital": 100000, "max_positions": 10, "strategy": {"type": "trend"}}
+            sell_signals = generate_sell_signals(portfolio.get("positions", {}), daily_quotes, config)
             logger.info(f"[卖出信号] {len(sell_signals)} 条")
         except Exception as e:
             logger.error(f"[卖出异常] {e}")
@@ -300,11 +397,30 @@ def run_brain_node():
         # ==========================================
         # 8. 买入决策 — 系统性风险熔断拦截
         # ==========================================
+        hot_sectors = []
+        try:
+            _news_cache_path = os.path.join(PROJECT_ROOT, "data_cache", "news_sentiment_cache.json")
+            if os.path.exists(_news_cache_path):
+                with open(_news_cache_path, "r", encoding="utf-8") as _nf:
+                    ns = json.load(_nf)
+                    hot_sectors = ns.get("hot_sectors", [])
+        except Exception as e:
+            logger.warning(f"读取资讯缓存获取 hot_sectors 失败: {e}")
+
         if systemic_risk_halt:
             logger.warning("🚨 [系统性风险] 本轮买入全部暂停，仅执行卖出。")
         else:
             for candidate in buy_candidates[:5]:  # 每轮最多5个买入信号
                 code = candidate.get("code", "")
+                
+                # 动量与龙头确认机制
+                is_momentum, mo_reason = _check_momentum_resonance(code, candidate, hot_sectors, _stock_history)
+                if not is_momentum:
+                    logger.info(f"[前排确认拦截] {code} {mo_reason}")
+                    continue
+                else:
+                    logger.info(f"[前排确认通过] {code} {mo_reason}")
+
                 
                 # DCA 日内冷却
                 if _is_dca_locked(code):
