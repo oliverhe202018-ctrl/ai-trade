@@ -9,15 +9,22 @@ import json
 import zmq
 from datetime import datetime
 from collections import OrderedDict
-from dotenv import load_dotenv
 import jsonschema
 
 # 添加项目根目录到 Python 路径，确保 core 和 feeds 模块可被引用
-PROJECT_ROOT = os.path.dirname(__file__)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-load_dotenv()
+# ── .env 安全加载（防 null 字符 ValueError，Windows <frozen os> 限制）──
+try:
+    from dotenv import dotenv_values
+    for _k, _v in dotenv_values().items():
+        if _v is not None and "\x00" not in _k and "\x00" not in _v:
+            os.environ.setdefault(_k, _v)
+except Exception as _e:
+    print(f"[DOTENV_ERROR] .env 加载异常，继续运行: {_e}")
+
 from core.logger_config import logger
 from core.state_manager import load_portfolio, save_portfolio
 from core.broker_adapter import MockBrokerAdapter, BaseBroker
@@ -28,359 +35,180 @@ from core.trading_state import get_trading_state, set_trading_state, TradingStat
 # 动态加载 券商网关 Adapter
 BROKER_TYPE = os.environ.get("BROKER_TYPE", "mock").lower()
 
-if BROKER_TYPE == "qmt":
-    from core.brokers.qmt_broker import QmtBroker
-    qmt_path = os.environ.get("QMT_PATH", r"D:\qmt\userdata_mini")
-    account_id = os.environ.get("QMT_ACCOUNT_ID", "")
-    broker: BaseBroker = QmtBroker(qmt_path=qmt_path, account_id=account_id)
-else:
+if BROKER_TYPE == "mock":
     broker: BaseBroker = MockBrokerAdapter()
-
-# 挂载全局订单生命周期管理器
-order_manager = OrderManager(broker, is_mock=(BROKER_TYPE == "mock"))
-
-def final_execution_gate(order, current_state, source):
-    from core.trading_state import TradingState
-    code = order.get("code") or order.get("symbol")
-    action = order.get("action")
-    shares = order.get("shares", 100)
-    
-    if not code or not action:
-        logger.warning(f"🛑 [FINAL_EXECUTION_GATE] 拦截: 缺少 code 或 action (Source: {source})")
-        if source == "MANUAL_ORDER":
-            logger.warning("🛑 [MANUAL_ORDER_BLOCK] 手动发单指令缺少必要字段")
-        return False
-        
-    action_upper = str(action).upper()
-    if action_upper not in ["BUY", "SELL", "REDUCE", "CONFIRM", "VETO"]:
-        logger.warning(f"🛑 [FINAL_EXECUTION_GATE] 拦截: 非法 action {action} (Source: {source})")
-        if source == "MANUAL_ORDER":
-            logger.warning(f"🛑 [MANUAL_ORDER_BLOCK] 手动发单指令异常")
-        return False
-        
-    if "shares" in order and shares <= 0:
-        logger.warning(f"🛑 [FINAL_EXECUTION_GATE] 拦截: shares <= 0 (Source: {source})")
-        if source == "MANUAL_ORDER":
-            logger.warning("🛑 [MANUAL_ORDER_BLOCK] 交易数量非法")
-        return False
-        
-    if current_state in [TradingState.FROZEN.value, TradingState.EMERGENCY.value, "FROZEN", "EMERGENCY"]:
-        if action_upper in ["BUY", "CONFIRM"]:
-            if "EMERGENCY" in str(current_state):
-                logger.warning(f"🛑 [EMERGENCY_BLOCK] 紧急锁定，彻底阻断买入 {code} (Source: {source})")
-            else:
-                logger.warning(f"🛑 [FROZEN_BLOCK] 系统冻结，彻底阻断买入 {code} (Source: {source})")
-                
-            if source == "MANUAL_ORDER":
-                logger.warning(f"🛑 [MANUAL_ORDER_BLOCK] 手动干预被当前状态 {current_state} 强制拦截！")
-            return False
-        elif action_upper in ["SELL", "REDUCE"]:
-            logger.warning(f"⚠️ [FINAL_EXECUTION_GATE] 允许 {current_state} 状态下的减仓/卖出动作: {code} (Source: {source})")
-            return True
-        else:
-            if "EMERGENCY" in str(current_state):
-                logger.warning(f"🛑 [EMERGENCY_BLOCK] 阻断未知 action: {action} (Source: {source})")
-            else:
-                logger.warning(f"🛑 [FROZEN_BLOCK] 阻断未知 action: {action} (Source: {source})")
-            return False
-            
-    return True
-
-def execute_single_order(order):
-    """原子化交易执行器（异步委托交由 OrderManager 处理）"""
-    code = order.get("code") or order.get("symbol")
-    action = order["action"]
-    shares = order.get("shares", 100)
-    fill_price = order.get("signal_price", 0.0)
-    name = order.get("name", code)
-    reason = order.get("reason", "")
-    decision_id = order.get("decision_id", "")
-    event_ids = order.get("event_ids", [])
-    source = order.get("source", "unknown")
-    trade_id = order.get("trade_id", "")
-    
-    if not trade_id:
-        logger.warning(f"[TRADE_TRACE_MISSING_TRADE_ID] {action} {code} missing trade_id")
-
-    price_type = "限价" if fill_price > 0 else "市价"
-    
-    # [新增风控阻断] 下单前强阻断逻辑
-    # [新增风控阻断] 下单前强阻断逻辑
+    logger.info("[BROKER] Mock 模式启动，使用虚拟撮合引擎。")
+else:
     try:
-        asset_data = broker.get_balance()
-        if not asset_data:
-            logger.error(f"❌ [下单失败] 资金获取失败，无法获取真实的资产结构")
-            return False
-            
-        # 根据 xtquant 或 dict 数据结构进行安全的属性/字典访问
-        if isinstance(asset_data, dict):
-            available_cash = asset_data.get('cash')
-        else:
-            available_cash = getattr(asset_data, 'm_dAvailable', getattr(asset_data, 'cash', None))
-            
-        if available_cash is None:
-            logger.error(f"❌ [下单失败] 资金获取失败，不存在合法的可用资金字段: {asset_data}")
-            return False
-    except Exception as e:
-        logger.error(f"❌ [下单失败] 资金校验异常: {e}")
-        return False
-        
-    try:
-        # 1. 提交物理委托
-        order_id = broker.place_order(
-            code=code, 
-            action=action, 
-            qty=shares, 
-            price_type=price_type, 
-            price=fill_price
-        )
-        
-        import json
-        audit_log = {
-            "order_id": order_id,
-            "trade_id": trade_id,
-            "decision_id": decision_id,
-            "event_ids": event_ids,
-            "source": source,
-            "symbol": code,
-            "action": action,
-            "shares": shares,
-            "event_type": "TRADE_EXECUTION"
-        }
-        logger.info(f"[TRADE_TRACE] {json.dumps(audit_log, ensure_ascii=False)}")
-        
-        # 2. 将订单交由状态机托管对账
-        order_manager.add_order(order_id, code, action, shares, reason)
-    except Exception as e:
-        logger.error(f"❌ [下单失败] {action} {code}: {e}")
+        from core.qmt_adapter import QMTBrokerAdapter
+        broker: BaseBroker = QMTBrokerAdapter()
+        logger.info("[BROKER] QMT 实盘适配器加载成功。")
+    except ImportError as e:
+        logger.critical(f"[BROKER] QMT 适配器加载失败，回退 Mock 模式: {e}")
+        broker: BaseBroker = MockBrokerAdapter()
 
-def phase_daily_settlement():
-    """阶段三：15:05 日终结算"""
-    logger.info(f"\n[{datetime.now().strftime('%H:%M:%S')}] === 日终资产结算 ===")
-    portfolio = load_portfolio()
-    daily_market_value = 0
-    
-    # 极速获取一次收盘价用于计算净值
-    for code, pos in portfolio["positions"].items():
-        try:
-            _, quotes, _ = download_historical_data(code, days=1)
-            latest_price = quotes[0]["price"] if quotes else pos["avg_price"]
-            daily_market_value += pos["shares"] * latest_price
-            pos["holding_days"] = pos.get("holding_days", 0) + 1
-        except Exception:
-            daily_market_value += pos["shares"] * pos["avg_price"]
+order_manager = OrderManager(broker)
 
-    portfolio.setdefault("cash", 100_000.0)
-    portfolio.setdefault("positions", {})
-    total_equity = portfolio["cash"] + daily_market_value
-    save_portfolio(portfolio)
-    logger.info(f"结算完成。当日净值: ¥{total_equity:.2f} | 现金: ¥{portfolio['cash']:.2f}")
-
-TRADE_SIGNAL_SCHEMA = {
+# ==========================================
+# 📋 JSON Schema 订单验证
+# ==========================================
+ORDER_SCHEMA = {
     "type": "object",
+    "required": ["code", "action", "quantity", "price"],
     "properties": {
-        "code": {"type": "string"},
-        "symbol": {"type": "string"},
-        "action": {"type": "string", "enum": ["BUY", "SELL", "REDUCE", "VETO", "HOLD"]},
-        "source": {"type": "string", "minLength": 1},
-        "trade_id": {"type": "string", "minLength": 1},
-        "decision_id": {"type": "string"},
-        "event_ids": {"type": "array", "items": {"type": ["integer", "string"]}},
-        "shares": {"type": ["number", "integer"], "minimum": 0},
-        "signal_price": {"type": "number", "minimum": 0},
-        "timestamp": {"type": "string"}
-    },
-    "required": ["action", "source", "trade_id", "decision_id", "event_ids", "shares", "signal_price", "timestamp"],
-    "anyOf": [
-        {"required": ["code"]},
-        {"required": ["symbol"]}
-    ]
+        "code":     {"type": "string", "minLength": 8, "maxLength": 12},
+        "action":   {"type": "string", "enum": ["BUY", "SELL"]},
+        "quantity": {"type": "number", "minimum": 100},
+        "price":    {"type": "number", "minimum": 0.01}
+    }
 }
 
-executed_ids = OrderedDict()
-MAX_CACHE_SIZE = 500
+# ==========================================
+# 🔒 对账熔断计数器
+# ==========================================
+_reconcile_fail_count = 0
+_RECONCILE_FAIL_THRESHOLD = 5
 
-def process_trade_signal_message(topic, payload):
+
+def validate_order(order: dict) -> bool:
+    """校验订单格式合法性"""
     try:
-        order = json.loads(payload)
-        jsonschema.validate(instance=order, schema=TRADE_SIGNAL_SCHEMA)
-    except jsonschema.ValidationError as ve:
-        logger.error(f"[TRADE_SIGNAL_SCHEMA_FAIL] ZMQ message schema invalid: {ve.message}")
-        return
-    except json.JSONDecodeError as e:
-        logger.error(f"[TRADE_SIGNAL_SCHEMA_FAIL] Invalid JSON payload: {e}")
-        return
-        
-    code = order.get("code") or order.get("symbol")
-    if not code:
-        logger.error("[TRADE_SIGNAL_SCHEMA_FAIL] Missing code/symbol")
-        return
-    order["code"] = code
-    
-    action = order.get("action", "").upper()
-    shares = order.get("shares", 0)
-    signal_price = order.get("signal_price", 0)
-    
-    if action in ["BUY", "SELL", "REDUCE"]:
-        if shares <= 0:
-            logger.error(f"[TRADE_SIGNAL_SCHEMA_FAIL] shares <= 0 for action {action}")
-            return
-        if signal_price <= 0:
-            logger.error(f"[TRADE_SIGNAL_SCHEMA_FAIL] signal_price <= 0 for action {action}")
-            return
-            
-    trade_id = order.get("trade_id")
-    if not trade_id:
-        logger.error("[TRADE_SIGNAL_SCHEMA_FAIL] Missing trade_id")
-        return
-        
-    if order.get("event_ids") is None:
-        logger.error("[TRADE_SIGNAL_SCHEMA_FAIL] event_ids cannot be null")
-        return
-        
-    order["order_id"] = order.get("order_id", trade_id)
-    
+        jsonschema.validate(instance=order, schema=ORDER_SCHEMA)
+        return True
+    except jsonschema.ValidationError as e:
+        logger.warning(f"[ORDER_SCHEMA] 订单格式非法: {e.message} | order={order}")
+        return False
+
+
+def get_asset_data_mock_safe() -> dict:
+    """
+    Mock 模式下从 MockBrokerAdapter 获取资产数据；
+    实盘模式下走真实接口，不存在时返回保守空字典。
+    """
     try:
-        current_state = get_trading_state()
+        if BROKER_TYPE == "mock":
+            bal = broker.balance if hasattr(broker, "balance") else {}
+            return {
+                "cash": bal.get("cash", 1_000_000.0),
+                "total_equity": bal.get("total_equity", bal.get("cash", 1_000_000.0)),
+                "market_value": bal.get("market_value", 0.0),
+            }
+        else:
+            return broker.get_balance()
     except Exception as e:
-        logger.error(f"[TRADING_STATE_UNAVAILABLE] Failed to get trading state: {e}")
-        return
-        
-    if not final_execution_gate(order, current_state, order.get("source", "TRADE_SIGNAL")):
-        return
-    
-    if action == "VETO":
-        logger.info(f"[{code}] Veto signal received, ignoring.")
-        return
-    
-    if trade_id in executed_ids:
-        executed_ids.move_to_end(trade_id)
-        logger.warning(f"⚠️ [幂等拦截] 截获重复指令 ID: {trade_id}，已自动丢弃并忽略")
-        return
-    executed_ids[trade_id] = True
-    if len(executed_ids) > MAX_CACHE_SIZE:
-        executed_ids.popitem(last=False)
-    
-    logger.info(f"\n🎯 [瞬时截获指令] {action} {code} (Source: {order.get('source')})")
-    
-    execute_single_order(order)
+        logger.warning(f"[ASSET_DATA] 获取资产数据失败，返回保守空字典: {e}")
+        return {"cash": 0.0, "total_equity": 0.0, "market_value": 0.0}
 
-def run_fast_hand():
-    logger.info("=" * 70)
-    logger.info("⚡ 实盘快手节点 (Fast Hand) 已启动")
-    logger.info(f"⚙️ 当前运行模式: {BROKER_TYPE.upper()}")
-    logger.info("=" * 70)
 
-    # ---------------- 预飞自检 (Pre-flight Check) ----------------
-    if BROKER_TYPE == "qmt":
-        logger.info("[Pre-flight] 正在进行 QMT 终端预飞自检...")
-        try:
-            balance_info = broker.get_balance()
-            # 必须成功返回非空字典且不能抛出异常
-            if balance_info is None:
-                raise ValueError("查询资金返回 None")
-            logger.info(f"✅ [OK] QMT 仿真/实盘接口已连接，当前可用资金: ¥{balance_info.get('cash', 0):.2f}")
-        except Exception as e:
-            logger.error(f"❌ [FATAL] QMT 客户端未连接或未登录，交易快手启动中止！原因: {e}")
-            sys.exit(1)
-    else:
-        logger.info("✅ [OK] 运行在 Mock 模式，跳过 QMT 自检。")
-    # -------------------------------------------------------------
+def phase_daily_settlement():
+    """日终结算：标记持仓、统计盈亏、重置状态"""
+    logger.info("[SETTLEMENT] 开始日终结算...")
+    portfolio = load_portfolio()
+    if not portfolio:
+        logger.warning("[SETTLEMENT] 无法读取组合，跳过结算。")
+        return
 
-    # 挂载 ZeroMQ 监听器
+    positions = portfolio.get("positions", {})
+    cash = portfolio.get("cash", 0.0)
+    total_profit = 0.0
+
+    for code, pos in positions.items():
+        cost = pos.get("avg_cost", 0) * pos.get("quantity", 0)
+        current_val = pos.get("current_price", pos.get("avg_cost", 0)) * pos.get("quantity", 0)
+        profit = current_val - cost
+        total_profit += profit
+        logger.info(f"[SETTLEMENT] {code}: 持仓={pos.get('quantity')} 成本={cost:.2f} 市值={current_val:.2f} 盈亏={profit:.2f}")
+
+    logger.info(f"[SETTLEMENT] 现金={cash:.2f} 持仓盈亏合计={total_profit:.2f} 净值≈{cash + total_profit:.2f}")
+    save_portfolio(portfolio)
+    logger.info("[SETTLEMENT] 日终结算完成。")
+
+
+def run_live_trader():
+    global _reconcile_fail_count
+
     context = zmq.Context()
-    
-    # 战术总线 (PUB/SUB 5555 and 5557)
     socket = context.socket(zmq.SUB)
-    socket.setsockopt(zmq.RCVHWM, 1000)
+    socket.connect("tcp://localhost:5555")
     socket.setsockopt_string(zmq.SUBSCRIBE, "TRADE_SIGNAL")
-    
-    endpoints = ["tcp://127.0.0.1:5555", "tcp://127.0.0.1:5557"]
-    connected_endpoints = []
-    for ep in endpoints:
-        try:
-            socket.connect(ep)
-            connected_endpoints.append(ep)
-            logger.info(f"[ZMQ_CONNECT] Successfully connected to {ep}")
-        except Exception as e:
-            logger.error(f"[ZMQ_CONNECT_FAIL] Failed to connect to {ep}: {e}")
+    logger.info("✅ ZeroMQ 订阅已连接 tcp://localhost:5555，监听 TRADE_SIGNAL...")
 
-    # 控制总线 (REQ/REP 5556)
-    control_socket = context.socket(zmq.REP)
-    control_socket.bind("tcp://127.0.0.1:5556")
-
-    settled_today = False
-    logger.info(f"[快手] 正在监听战术指挥网节点: {connected_endpoints}")
-    logger.info("[快手] 正在监听全局风控控制总线 (TCP 5556)...")
-
-    _reconcile_fail_count = 0
+    settlement_done_today = False
 
     while True:
         now = datetime.now()
-        
-        # 0. 优先级最高：控制总线监听
-        try:
-            ctrl_msg = control_socket.recv_string(flags=zmq.NOBLOCK)
-            try:
-                ctrl_data = json.loads(ctrl_msg)
-                cmd = ctrl_data.get("command")
-                if cmd == "FREEZE":
-                    set_trading_state(TradingState.FROZEN)
-                    logger.critical("🛑 [风控] 收到控制总线冻结指令，系统已紧急锁定！")
-                    control_socket.send_string(json.dumps({"status": "ACK", "state": "FROZEN"}))
-                elif cmd == "MANUAL_ORDER":
-                    order = ctrl_data.get("order")
-                    logger.warning(f"⚡ [风控] 收到手动干预直达订单: {order.get('action')} {order.get('code')}")
-                    current_state = get_trading_state()
-                    if final_execution_gate(order, current_state, "MANUAL_ORDER"):
-                        execute_single_order(order)
-                        control_socket.send_string(json.dumps({"status": "ACK"}))
-                    else:
-                        control_socket.send_string(json.dumps({"status": "NACK", "reason": "Blocked by final_execution_gate"}))
-                else:
-                    control_socket.send_string(json.dumps({"status": "NACK", "reason": "Unknown command"}))
-            except Exception as e:
-                logger.error(f"处理控制总线消息失败: {e}")
-                control_socket.send_string(json.dumps({"status": "ERROR", "reason": str(e)}))
-        except zmq.Again:
-            pass
 
-        # 1. 极速非阻塞监听 (0.01秒心跳)
-        try:
-            message = socket.recv_string(flags=zmq.NOBLOCK)
-            parts = message.split(" ", 1)
-            if len(parts) == 2:
-                topic, payload = parts
-                process_trade_signal_message(topic, payload)
-        except zmq.Again:
-            pass # 当前无信号，放行
-
-        # 2. 触发日终结算 (15:05)
-        if now.hour == 15 and now.minute >= 5 and not settled_today:
+        # 15:05 日终结算（每日一次）
+        if now.hour == 15 and now.minute >= 5 and not settlement_done_today:
             phase_daily_settlement()
-            settled_today = True
+            settlement_done_today = True
 
-        # 3. 跨日重置
-        if now.hour == 9 and now.minute < 10:
-            settled_today = False
+        if now.hour == 9 and now.minute < 25:
+            settlement_done_today = False  # 重置当日结算标志
 
-        # 4. 高频订单对账与状态跃迁
+        # ── 对账循环 ──
         try:
-            # 增加一行调试日志打印真实结构
-            asset_data = broker.get_balance()
-            logger.info(f"Raw asset data: {asset_data}")
-            
             order_manager.sync_orders()
             _reconcile_fail_count = 0
+        except KeyError as e:
+            _reconcile_fail_count += 1
+            logger.error(
+                f"[OrderManager] 对账异常: {e!r} "
+                f"({_reconcile_fail_count}/{_RECONCILE_FAIL_THRESHOLD})"
+            )
+            if _reconcile_fail_count >= _RECONCILE_FAIL_THRESHOLD:
+                logger.critical("[CIRCUIT_BREAKER] 对账连续失败，触发 FROZEN 状态！")
+                set_trading_state(TradingState.FROZEN)
+                _reconcile_fail_count = 0
         except Exception as e:
             _reconcile_fail_count += 1
-            logger.error(f"[OrderManager] 对账异常: {e}")
-            if _reconcile_fail_count >= 5:
-                logger.critical(f"🛑 [风控] 连续对账异常达5次，触发系统大盘熔断！")
+            logger.error(
+                f"[OrderManager] 对账未知异常: {e!r} "
+                f"({_reconcile_fail_count}/{_RECONCILE_FAIL_THRESHOLD})"
+            )
+            if _reconcile_fail_count >= _RECONCILE_FAIL_THRESHOLD:
+                logger.critical("[CIRCUIT_BREAKER] 对账连续失败，触发 FROZEN 状态！")
                 set_trading_state(TradingState.FROZEN)
                 _reconcile_fail_count = 0
 
-        time.sleep(0.01)
+        # ── 接收交易信号 ──
+        try:
+            msg = socket.recv_string(flags=zmq.NOBLOCK)
+            _, payload = msg.split(" ", 1)
+            order = json.loads(payload)
+
+            if not validate_order(order):
+                continue
+
+            trading_state = get_trading_state()
+            if trading_state != TradingState.ACTIVE:
+                logger.warning(
+                    f"[TRADING_STATE_UNAVAILABLE] 状态={trading_state}，"
+                    f"信号 {order.get('code')} {order.get('action')} 被阻断。"
+                )
+                continue
+
+            asset_data = get_asset_data_mock_safe()
+            logger.info(f"[ORDER_EXEC] 执行: {order} | 可用资金={asset_data.get('cash', 0):.2f}")
+
+            try:
+                result = broker.place_order(order)
+                order_manager.track_order(result)
+                logger.info(
+                    f"[TRADE_TRACE] code={order.get('code')} action={order.get('action')} "
+                    f"qty={order.get('quantity')} price={order.get('price')} "
+                    f"result={result}"
+                )
+            except Exception as e:
+                logger.error(f"[ORDER_EXEC_FAIL] 下单失败: {e} | order={order}")
+
+        except zmq.Again:
+            pass  # 无新消息，正常
+        except Exception as e:
+            logger.error(f"[ZMQ_RECV] 消息接收异常: {e}")
+
+        time.sleep(0.1)
+
 
 if __name__ == "__main__":
-    run_fast_hand()
+    run_live_trader()
