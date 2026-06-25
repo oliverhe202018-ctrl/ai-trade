@@ -332,7 +332,7 @@ def module_news_sentiment():
     st.header("📰 资讯情绪中枢")
     st.caption("数据来源：brain_node 每轮演算写入 data_cache/news_sentiment_cache.json")
 
-    cache_file = CACHE_DIR / "news_sentiment_cache.json"
+    cache_file = Path(CACHE_DIR) / "news_sentiment_cache.json"
 
     def _load_cache():
         try:
