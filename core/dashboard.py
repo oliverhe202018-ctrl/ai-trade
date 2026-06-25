@@ -1880,6 +1880,59 @@ def module_news_sentiment():
         st.json(data)
 
 
+def module_paper_trading_performance():
+    """📈 模拟盘绩效"""
+    import json
+    perf_path = os.path.join(PROJECT_ROOT, "data_cache", "paper_performance.json")
+    if not os.path.exists(perf_path):
+        st.info("暂无模拟盘绩效数据，请先运行 paper_trade_engine.py")
+        return
+
+    try:
+        with open(perf_path, "r", encoding="utf-8") as f:
+            s = json.load(f)
+    except Exception:
+        st.error("模拟盘绩效数据读取失败")
+        return
+
+    st.caption(f"生成时间: {s.get('generated_at', '?')} | 窗口: {s.get('window', {}).get('hours', '?')} 小时 | 数据条目: {s.get('window', {}).get('fill_entries', 0)} 条")
+
+    b = s.get("basic_stats", {})
+    d = s.get("direction_stats", {})
+    p = s.get("portfolio_stats", {})
+    a = s.get("anomaly_stats", {})
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("当前现金", f"¥{p.get('current_cash', 0):,.2f}")
+    col2.metric("持仓标的", p.get("open_positions", 0))
+    col3.metric("成交/拒单", f"{b.get('filled_orders', 0)}/{b.get('rejected_orders', 0)}")
+
+    col4, col5, col6 = st.columns(3)
+    col4.metric("BUY 成交", d.get("buy_count", 0))
+    col5.metric("SELL 成交", d.get("sell_count", 0))
+    col6.metric("持仓成本", f"¥{p.get('total_cost_basis', 0):,.2f}")
+
+    if p.get("positions_detail"):
+        st.divider()
+        st.caption("持仓明细")
+        for pos in p["positions_detail"]:
+            st.text(f"  {pos['code']} {pos['quantity']}股 @ ¥{pos['avg_cost']:.3f}  成本 ¥{pos['cost_basis']:,.2f}")
+
+    with st.expander("⚠️ 异常与风险", expanded=False):
+        st.text(f"JSON 解析错误: {a.get('json_decode_errors', 0)} 次")
+        st.text(f"数据污染: {'检测到' if a.get('data_pollution', {}).get('detected') else '无'} ({a.get('data_pollution', {}).get('polluted_count', 0)} 条)")
+        if a.get("reject_reasons"):
+            st.text("拒单原因: " + ", ".join(f"{k}×{v}" for k, v in a["reject_reasons"].items()))
+        st.caption("以下指标当前不可计算：")
+        for metric, reason in sorted(s.get("unavailable", {}).items())[:6]:
+            st.text(f"  {metric}: {reason}")
+
+    with st.expander("📋 最近成交流水", expanded=False):
+        for fill in s.get("recent_fills", [])[:5]:
+            icon = {"FILLED": "✅", "REJECTED": "❌", "SKIPPED": "⏭️"}.get(fill.get("status", ""), "❓")
+            st.text(f"{icon} {fill.get('timestamp', '?')} {fill.get('action', '?')} {fill.get('code', '?')} x{fill.get('quantity', 0)} [{fill.get('status', '?')}]")
+
+
 def module_observation_reports():
     st.header("👀 72 小时并行观察报告")
     st.markdown("这里汇集了最新一轮脚本自动扫描生成的报告文件。如果文件不存在请确保运行了 `scripts/run_72h_observation.py`。")

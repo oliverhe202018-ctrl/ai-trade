@@ -38,6 +38,8 @@ def classify_intent(query: str) -> str:
         return "POTENTIAL"
     elif any(k in q for k in ["主力", "资金", "大单", "资金流", "托单", "压单"]):
         return "MAIN_MONEY"
+    elif any(k in q for k in ["模拟盘", "paper", "paper trade", "模拟交易", "模拟成交", "模拟持仓"]):
+        return "PAPER"
     else:
         return "GENERAL"
 
@@ -160,8 +162,28 @@ class MainMoneyProvider(ContextProvider):
             context.append("当前后台未捕获到主力资金流水，请确认盘口追踪器是否开启。")
         return "\n".join(context)
 
+class PaperTradingContextProvider(ContextProvider):
+    """模拟盘绩效上下文提供者。"""
+    def provide(self, intent: str, query: str, app_state: dict) -> str:
+        if intent not in ["PAPER", "GENERAL", "SYSTEM", "PORTFOLIO"]:
+            return ""
+        try:
+            from core.paper_trading_provider import PaperTradingProvider
+            provider = PaperTradingProvider()
+            parts = [provider.get_summary()]
+            if "持仓" in query:
+                parts.append(provider.get_positions())
+            if "拒单" in query or "拒绝" in query or "reject" in query.lower():
+                parts.append(provider.get_rejections())
+            if "成交" in query or "最近" in query:
+                parts.append(provider.get_recent_fills(n=5))
+            return "\n\n".join(parts)
+        except Exception:
+            return ""
+
+
 def build_dynamic_context(intent: str, query: str, app_state: dict) -> tuple[str, list]:
-    providers = [SystemProvider(), PortfolioProvider(), NewsProvider(), SignalProvider(), AlertProvider(), PotentialProvider(), MainMoneyProvider()]
+    providers = [SystemProvider(), PortfolioProvider(), NewsProvider(), SignalProvider(), AlertProvider(), PotentialProvider(), MainMoneyProvider(), PaperTradingContextProvider()]
     context_parts = []
     used_providers = []
     
