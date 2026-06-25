@@ -104,6 +104,30 @@ def execute_single_order(order):
 
     price_type = "限价" if fill_price > 0 else "市价"
     
+    # [新增风控阻断] 下单前强阻断逻辑
+    if BROKER_TYPE == "mock":
+        asset_data = {"cash": 1000000.0, "market_value": 0}
+        logger.info(f"Mock模式直接放行，模拟资金: {asset_data}")
+    else:
+        try:
+            asset_data = broker.get_balance()
+            if not asset_data:
+                logger.error(f"❌ [下单失败] 资金获取失败，无法获取真实的资产结构")
+                return False
+                
+            # 根据 xtquant 或 dict 数据结构进行安全的属性/字典访问
+            if isinstance(asset_data, dict):
+                available_cash = asset_data.get('cash')
+            else:
+                available_cash = getattr(asset_data, 'm_dAvailable', getattr(asset_data, 'cash', None))
+                
+            if available_cash is None:
+                logger.error(f"❌ [下单失败] 资金获取失败，不存在合法的可用资金字段: {asset_data}")
+                return False
+        except Exception as e:
+            logger.error(f"❌ [下单失败] 资金校验异常: {e}")
+            return False
+        
     try:
         # 1. 提交物理委托
         order_id = broker.place_order(
@@ -341,6 +365,13 @@ def run_fast_hand():
 
         # 4. 高频订单对账与状态跃迁
         try:
+            # 增加一行调试日志打印真实结构
+            if BROKER_TYPE == "mock":
+                asset_data = {"cash": 1000000.0, "market_value": 0}
+            else:
+                asset_data = broker.get_balance()
+            logger.info(f"Raw asset data: {asset_data}")
+            
             order_manager.sync_orders()
         except Exception as e:
             logger.error(f"[OrderManager] 对账异常: {e}")

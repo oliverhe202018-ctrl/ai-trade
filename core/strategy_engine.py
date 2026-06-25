@@ -126,10 +126,10 @@ def select_stocks(quotes, positions, config, mode="mock"):
         logger.info(f"  [缓存拦截] 命中 {len(cached_results)} 只，需 AI 打分 {len(needs_ai_scoring)} 只")
         
         # 分批打分与错题本标记
+        scored_stocks = []
         if needs_ai_scoring:
             CHUNK_SIZE = 5
             chunks = [needs_ai_scoring[i:i + CHUNK_SIZE] for i in range(0, len(needs_ai_scoring), CHUNK_SIZE)]
-            scored_stocks = []
 
             for chunk_idx, chunk in enumerate(chunks, start=1):
                 try:
