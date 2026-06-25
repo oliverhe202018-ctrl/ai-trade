@@ -170,6 +170,8 @@ def phase_daily_settlement():
         except Exception:
             daily_market_value += pos["shares"] * pos["avg_price"]
 
+    portfolio.setdefault("cash", 100_000.0)
+    portfolio.setdefault("positions", {})
     total_equity = portfolio["cash"] + daily_market_value
     save_portfolio(portfolio)
     logger.info(f"结算完成。当日净值: ¥{total_equity:.2f} | 现金: ¥{portfolio['cash']:.2f}")

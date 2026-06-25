@@ -36,6 +36,7 @@ _last_dca_date = datetime.now().date()
 _last_index_change_pct = None  # 增加：大盘风控缓存
 
 _stale_cache_counter = 0
+_STALE_CACHE_HALT_THRESHOLD = 6
 
 def _get_index_change_pct_from_cache():
     """从本地缓存文件读取大盘跌幅"""
@@ -50,6 +51,9 @@ def _get_index_change_pct_from_cache():
             if time.time() - data.get("ts", 0) > 600:
                 _stale_cache_counter += 1
                 logger.warning(f"[INDEX_CACHE_STALE] 大盘缓存文件超过 10 分钟未更新！连续陈旧次数: {_stale_cache_counter}，准备 fallback 到内存缓存")
+                if _stale_cache_counter >= _STALE_CACHE_HALT_THRESHOLD:
+                    logger.critical(f"[INDEX_CACHE_STALE] 连续陈旧次数达到阈值 {_STALE_CACHE_HALT_THRESHOLD}，熔断交易！")
+                    set_trading_state(TradingState.FROZEN)
                 return None
                 
             _stale_cache_counter = 0
@@ -117,7 +121,7 @@ def run_slow_brain():
     def send_order(action: str, code: str, shares: int, price: float, reason: str):
         import uuid
         # 5分钟指纹幂等性ID
-        order_id = f"{code}_{action}_{int(time.time())//300}"
+        order_id = f"{code}_{action}_{int(time.time())//60}"
         trade_id = str(uuid.uuid4())
         order = {
             "order_id": order_id,

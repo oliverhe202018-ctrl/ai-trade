@@ -43,22 +43,28 @@ def fetch_layer1_em_akshare(hours=24):
         cutoff_time = datetime.now() - timedelta(hours=hours)
         
         columns = list(news_df.columns)
-        KNOWN_COLUMNS = {
-            "time": ["发布时间", "时间", "publish_time"], 
-            "content": ["摘要", "内容", "news_content", "标题", "title"],
-            "title": ["标题", "title"]
-        }
+        _TIME_COLS = ["发布时间", "时间", "publish_time", "date"]
+        _DIGEST_COLS = ["摘要", "digest", "内容", "content"]
+        _TITLE_COLS = ["标题", "title"]
+
+        def _find_col(columns, candidates):
+            for c in candidates:
+                if c in columns: return c
+            for c in candidates:
+                for col in columns:
+                    if c in col: return col
+            return None
+
+        time_col = _find_col(columns, _TIME_COLS)
+        digest_col = _find_col(columns, _DIGEST_COLS)
+        title_col = _find_col(columns, _TITLE_COLS)
         
-        time_col = next((c for c in columns if any(k in c.lower() for k in KNOWN_COLUMNS["time"])), None)
-        title_col = next((c for c in columns if any(k in c.lower() for k in KNOWN_COLUMNS["title"])), None)
-        content_col = next((c for c in columns if any(k in c.lower() for k in KNOWN_COLUMNS["content"])), None)
-        
-        if not time_col or not (content_col or title_col):
+        if not time_col or not (digest_col or title_col):
             logger.warning(f"[NEWS-L1] 无法识别数据列: {columns}")
             return None
             
-        if not content_col:
-            content_col = title_col
+        if not digest_col:
+            digest_col = title_col
         
         for idx, row in news_df.iterrows():
             try:
@@ -72,9 +78,9 @@ def fetch_layer1_em_akshare(hours=24):
                     pass
                     
                 title_text = str(row[title_col]) if title_col else ""
-                digest_text = str(row[content_col]) if content_col else ""
+                digest_text = str(row[digest_col]) if digest_col else ""
                 
-                if title_col and content_col and title_col != content_col and title_text and digest_text and title_text != digest_text:
+                if title_col and digest_col and title_col != digest_col and title_text and digest_text and title_text != digest_text:
                     content = f"{title_text}。{digest_text}"
                 else:
                     content = digest_text or title_text
@@ -114,13 +120,11 @@ def fetch_layer2_em_http(hours=24):
         response.raise_for_status()
         
         data = response.json()
-        if data.get("code", 0) not in (0, 200) or data.get("data") is None:
-            logger.warning(f"[NEWS-L2] 接口返回异常: code={data.get('code')}")
+        raw_data = data.get("data")
+        if not isinstance(raw_data, dict) or not raw_data.get("list"):
+            logger.warning(f"[NEWS-L2] 接口响应结构异常: {str(data)[:200]}")
             return None
-            
-        list_data = data.get("data", {}).get("list", [])
-        if not list_data:
-            return None
+        list_data = raw_data["list"]
             
         filtered_news = []
         cutoff_time = datetime.now() - timedelta(hours=hours)
@@ -274,14 +278,14 @@ def _rule_engine_fallback(news_list):
                 elif code.startswith("8"):
                     risk_warnings.add(f"bj{code}")
             
-    net = bull_score - bear_score
-    if net >= 10:
+    net_per_100 = (bull_score - bear_score) / max(len(news_list), 1) * 100
+    if net_per_100 >= 8:
         macro_sentiment = 2
-    elif net >= 4:
+    elif net_per_100 >= 3:
         macro_sentiment = 1
-    elif net <= -10:
+    elif net_per_100 <= -8:
         macro_sentiment = -2
-    elif net <= -4:
+    elif net_per_100 <= -3:
         macro_sentiment = -1
     else:
         macro_sentiment = 0
@@ -388,12 +392,13 @@ def get_news_sentiment(hours=24):
     """主入口"""
     news_list, source = fetch_news_waterfall(hours)
     
-    if source == "ALL_FAILED":
+    if not news_list:
+        fallback_watchlist = os.environ.get("NEWS_FALLBACK_WATCHLIST", "sh600519,sh000001").split(",")
         return {
             "macro_sentiment": 0,
             "hot_sectors": [],
-            "risk_warnings": [],
-            "_source": "ALL_FAILED",
+            "risk_warnings": fallback_watchlist,
+            "_source": source if source == "ALL_FAILED" else "empty_news",
             "_news_count": 0
         }
         
@@ -421,10 +426,6 @@ def get_news_sentiment(hours=24):
         fallback_res["_news_count"] = news_count
         return fallback_res
 
-
-# ============================================================
-# Dashboard 深度分析 - 真实个股舆情数据管道
-# ============================================================
 
 def fetch_stock_news(stock_code: str, limit: int = 5) -> list:
     """
@@ -460,8 +461,3 @@ def fetch_stock_news(stock_code: str, limit: int = 5) -> list:
         from core.logger_config import logger
         logger.error(f"资讯获取失败 {stock_code}: {e}")
         return []
-
-if __name__ == "__main__":
-    import json
-    result = get_news_sentiment(hours=24)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
