@@ -97,6 +97,8 @@ news_data:
       enabled: true
       poll_interval_seconds: 300
       timeout_seconds: 8
+      max_pages: 5                  # 翻页数 (双栏目各5页, 约300条)
+      recent_hours: 24              # 时间窗口
     eastmoney:
       enabled: true
       poll_interval_seconds: 600

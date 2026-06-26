@@ -36,7 +36,11 @@ class NewsEventBus:
             
         provider_cfg = news_cfg.get("providers", {})
         if provider_cfg.get("cninfo", {}).get("enabled", False):
-            self.register_provider("cninfo", CninfoNewsProvider())
+            cninfo_cfg = provider_cfg["cninfo"]
+            self.register_provider("cninfo", CninfoNewsProvider(
+                max_pages=cninfo_cfg.get("max_pages", 5),
+                recent_hours=cninfo_cfg.get("recent_hours", 24),
+            ))
         if provider_cfg.get("cls", {}).get("enabled", False):
             self.register_provider("cls", ClsNewsProvider())
         if provider_cfg.get("eastmoney", {}).get("enabled", False):
