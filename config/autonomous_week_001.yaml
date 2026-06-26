@@ -1,0 +1,44 @@
+# Autonomous Week 001 — Paper Trading Experiment Configuration
+# ⚠️  PAPER TRADING ONLY — LIVE TRADING IS FORBIDDEN
+
+experiment_name: autonomous_week_001
+paper_trading_only: true
+allow_live_trading: false
+allow_news_trade_trigger: false
+allow_state_mutation: false
+
+paths:
+  reports: reports/autonomous_week_001
+  logs: logs/autonomous_week_001
+  strategies: strategies/autonomous_week_001
+
+risk_limits:
+  max_daily_loss_pct: 2.0
+  max_trades_per_day: 10
+  max_consecutive_losses: 3
+  stop_on_system_error: true
+
+permissions:
+  allowed_write_paths:
+    - reports/autonomous_week_001
+    - logs/autonomous_week_001
+    - strategies/autonomous_week_001
+  forbidden_paths:
+    - live_trader.py
+    - .env
+    - .env.example
+    - broker_adapter.py
+    - trading_state.py
+    - trade_engine.py
+
+news:
+  use_news_for_context: true
+  allow_news_to_trigger_trade: false
+  allow_news_to_mutate_state: false
+
+dry_run:
+  default: true
+  supervised_paper_requires:
+    - explicit_duration_minutes
+    - subprocess_timeout
+    - log_capture_enabled
