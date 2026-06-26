@@ -45,6 +45,15 @@ python scripts/run_autonomous_postmarket.py --day 1 --dry-run
 - Dry-run is the default mode for intraday
 - Supervised paper mode requires explicit --supervised-paper flag + duration
 
+## Startup Autorun Safety Baseline
+- **Commit**: 477864a
+- **Startup audit**: `reports/STARTUP_AUTORUN_AUDIT_REPORT.md`
+- **HIGH-risk items disabled**:
+  - `start_matrix.bat` → launches `live_trader.py` on boot → REMOVED
+  - `start_system.bat` → launches agent_daemon on boot → REMOVED
+- **No `live_trader.py` auto-start paths remain** (Startup folder, Task Scheduler, Registry all clean)
+- **Backups**: `backups/startup_disabled/`
+
 ## Directory Structure
 ```
 reports/autonomous_week_001/

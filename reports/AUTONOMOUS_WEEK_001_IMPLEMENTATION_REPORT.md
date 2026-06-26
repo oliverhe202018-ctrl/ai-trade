@@ -63,6 +63,20 @@ For supervised paper mode (future), it requires:
 | Autonomous scripts import `broker_adapter` | NO |
 | `.env` in allowed write paths | NO |
 
+### Startup Autorun Safety Baseline (commit 477864a)
+
+In addition to runtime safety gates, OS-level startup autorun paths have been audited and cleaned:
+
+| Item | Risk | Action |
+|------|------|--------|
+| `start_matrix.bat` startup shortcut (launches `live_trader.py` on boot) | HIGH | Removed from Startup folder → `backups/startup_disabled/` |
+| `start_system.bat` startup shortcut (launches agent_daemon, dashboard) | HIGH | Removed from Startup folder → `backups/startup_disabled/` |
+| Windows Task Scheduler `live_trader` tasks | N/A | None found |
+| Registry `Run` keys (ai-trader related) | N/A | None found |
+
+**Result**: Zero `live_trader.py` auto-start paths remain at the OS level.
+Full audit report: `reports/STARTUP_AUTORUN_AUDIT_REPORT.md`
+
 ## 6. News Integration (Read-Only)
 
 CoverageGate read via `get_status_report()` — returns status + coverage rate.
