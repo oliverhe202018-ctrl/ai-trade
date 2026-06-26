@@ -97,10 +97,23 @@ news_data:
       enabled: true
       poll_interval_seconds: 300
       timeout_seconds: 8
+    eastmoney:
+      enabled: true
+      poll_interval_seconds: 600
+      timeout_seconds: 15
+      symbol_count: 25           # 每轮拉取的股票数 (默认25, 25s @ 1req/s)
+      news_per_symbol: 20        # 每只股票最多拉取新闻数
   readonly: true
   store:
     path: data_cache/news_events.db
     type: sqlite
+  # ── 覆盖率门控 ──
+  coverage_gate:
+    enabled: true
+    healthy_threshold: 0.20     # ≥20% → 资讯因子权重 100%
+    weak_threshold: 0.05        # ≥5%  → 资讯因子权重 30%
+    # coverage < 5% → 资讯因子权重 0% (禁用)
+    cache_ttl_seconds: 600      # 覆盖率缓存 10 分钟
 hyperparams:
   atr_period: 14
   risk_per_trade: 0.008

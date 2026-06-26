@@ -13,6 +13,7 @@ if PROJECT_ROOT not in sys.path:
 from core.logger_config import logger
 from feeds.cninfo_news_provider import CninfoNewsProvider
 from feeds.cls_news_provider import ClsNewsProvider
+from feeds.eastmoney_news_provider import EastMoneyNewsProvider
 from feeds.news_event_store import NewsEventStore
 
 class NewsEventBus:
@@ -36,6 +37,8 @@ class NewsEventBus:
             self.register_provider("cninfo", CninfoNewsProvider())
         if provider_cfg.get("cls", {}).get("enabled", False):
             self.register_provider("cls", ClsNewsProvider())
+        if provider_cfg.get("eastmoney", {}).get("enabled", False):
+            self.register_provider("eastmoney", EastMoneyNewsProvider())
             
         logger.info(f"[NewsEventBus] 初始化完成，已挂载 {len(self.providers)} 个 Provider")
 
