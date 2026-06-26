@@ -106,13 +106,18 @@ news_data:
       symbol_count: 25              # 每轮拉取的股票数
       news_per_symbol: 20           # 每只股票最多拉取新闻数
       max_pages: 5                  # 最大翻页数 (totalCount驱动, 实际不超过此值)
+      page_size: 20                 # 每页条数
       recent_hours: null            # 时间窗口过滤 (null=不过滤)
+      request_delay_min: 1.0        # 随机延时最小值 (秒)
+      request_delay_max: 2.5        # 随机延时最大值 (秒)
       categories:                   # 栏目列表
         - stock                     # 个股新闻
         - announcement              # 公告
         - report                    # 研报
         - flash                     # 7x24快讯
         - sector                    # 板块资讯
+      sector:
+        max_keywords_per_run: 3     # 板块每轮最多关键词数
     sse:
       enabled: true
       poll_interval_seconds: 600    # 上交所公告 (公告量大, 10分钟合适)

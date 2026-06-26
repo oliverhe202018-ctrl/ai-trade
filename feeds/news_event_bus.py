@@ -46,10 +46,15 @@ class NewsEventBus:
             self.register_provider("cls", ClsNewsProvider())
         if provider_cfg.get("eastmoney", {}).get("enabled", False):
             em_cfg = provider_cfg["eastmoney"]
+            sector_cfg = em_cfg.get("sector", {})
             em_provider = EastMoneyNewsProvider(
                 max_pages=em_cfg.get("max_pages", 5),
                 recent_hours=em_cfg.get("recent_hours", None),
                 categories=em_cfg.get("categories", ["stock", "announcement", "report"]),
+                request_delay_min=em_cfg.get("request_delay_min", 1.0),
+                request_delay_max=em_cfg.get("request_delay_max", 2.5),
+                page_size=em_cfg.get("page_size", 20),
+                sector_max_keywords=sector_cfg.get("max_keywords_per_run", 3),
             )
             self.register_provider("eastmoney", em_provider)
 
