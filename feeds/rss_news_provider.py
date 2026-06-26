@@ -348,8 +348,8 @@ class RssNewsProvider(BaseNewsProvider):
         if not text:
             return []
         codes = set()
-        # Use lookbehind/lookahead instead of \b (CJK characters break \b)
-        for m in _re.finditer(r'(?:^|[^\d])(\d{6})(?:$|[^\d])', text):
+        # Use lookbehind and non-consuming lookahead to avoid overlapping matches
+        for m in _re.finditer(r'(?:^|[^\d])(\d{6})(?=$|[^\d])', text):
             code = m.group(1)
             if not code.isdigit():
                 continue
