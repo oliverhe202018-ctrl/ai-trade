@@ -125,6 +125,23 @@ news_data:
       timeout_seconds: 15
       max_pages: 5                  # 最大翻页数 (约150条)
       recent_hours: 24              # 时间窗口 (仅抓取最近24小时)
+    rss:
+      enabled: true
+      poll_interval_seconds: 600    # RSS聚合 (低优先级, 10分钟)
+      timeout_seconds: 15
+      feeds:                        # Feed 源列表 (支持json_api/rss_atom)
+        - name: "sina_finance"
+          type: "json_api"
+          url: "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2509&k=&num=20&page=1"
+          data_path: "result.data"
+          timeout_seconds: 10
+          weight: 1.0              # 权重 (1.0=全量, 0=禁用)
+        - name: "sina_astock"
+          type: "json_api"
+          url: "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2512&k=&num=20&page=1"
+          data_path: "result.data"
+          timeout_seconds: 10
+          weight: 0.8              # A股降权0.8
   readonly: true
   store:
     path: data_cache/news_events.db

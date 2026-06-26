@@ -16,6 +16,7 @@ from feeds.cls_news_provider import ClsNewsProvider
 from feeds.eastmoney_news_provider import EastMoneyNewsProvider
 from feeds.sse_news_provider import SseNewsProvider
 from feeds.szse_news_provider import SzseNewsProvider
+from feeds.rss_news_provider import RssNewsProvider
 from feeds.news_event_store import NewsEventStore
 
 class NewsEventBus:
@@ -67,6 +68,12 @@ class NewsEventBus:
                 recent_hours=szse_cfg.get("recent_hours", 24),
             )
             self.register_provider("szse", szse_provider)
+
+        if provider_cfg.get("rss", {}).get("enabled", False):
+            rss_cfg = provider_cfg["rss"]
+            feeds_list = rss_cfg.get("feeds", [])
+            rss_provider = RssNewsProvider(feeds=feeds_list if feeds_list else None)
+            self.register_provider("rss", rss_provider)
 
         logger.info(f"[NewsEventBus] 初始化完成，已挂载 {len(self.providers)} 个 Provider")
 
