@@ -14,6 +14,8 @@ from core.logger_config import logger
 from feeds.cninfo_news_provider import CninfoNewsProvider
 from feeds.cls_news_provider import ClsNewsProvider
 from feeds.eastmoney_news_provider import EastMoneyNewsProvider
+from feeds.sse_news_provider import SseNewsProvider
+from feeds.szse_news_provider import SzseNewsProvider
 from feeds.news_event_store import NewsEventStore
 
 class NewsEventBus:
@@ -38,8 +40,30 @@ class NewsEventBus:
         if provider_cfg.get("cls", {}).get("enabled", False):
             self.register_provider("cls", ClsNewsProvider())
         if provider_cfg.get("eastmoney", {}).get("enabled", False):
-            self.register_provider("eastmoney", EastMoneyNewsProvider())
-            
+            em_cfg = provider_cfg["eastmoney"]
+            em_provider = EastMoneyNewsProvider(
+                max_pages=em_cfg.get("max_pages", 5),
+                recent_hours=em_cfg.get("recent_hours", None),
+                categories=em_cfg.get("categories", ["stock", "announcement", "report"]),
+            )
+            self.register_provider("eastmoney", em_provider)
+
+        if provider_cfg.get("sse", {}).get("enabled", False):
+            sse_cfg = provider_cfg["sse"]
+            sse_provider = SseNewsProvider(
+                max_pages=sse_cfg.get("max_pages", 5),
+                recent_hours=sse_cfg.get("recent_hours", 24),
+            )
+            self.register_provider("sse", sse_provider)
+
+        if provider_cfg.get("szse", {}).get("enabled", False):
+            szse_cfg = provider_cfg["szse"]
+            szse_provider = SzseNewsProvider(
+                max_pages=szse_cfg.get("max_pages", 5),
+                recent_hours=szse_cfg.get("recent_hours", 24),
+            )
+            self.register_provider("szse", szse_provider)
+
         logger.info(f"[NewsEventBus] 初始化完成，已挂载 {len(self.providers)} 个 Provider")
 
     def run_polling_cycle(self):
