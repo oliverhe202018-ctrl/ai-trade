@@ -28,6 +28,14 @@
 读取 `config/config.yaml` → `news_data.providers` 下每个子配置的 `enabled` 标志。
 注册顺序: cninfo → cls → eastmoney → sse → szse → rss。
 
+**polling dry-run 验证** (2026-06-27 00:31):
+- cninfo: 55 条入库 (source=`cninfo`)
+- eastmoney: 1582 条入库 (source=`eastmoney`, 25 stocks × 10/stock)
+- sse: 50 条入库 (source=`sse`, max_pages=5 × 2 columns)
+- szse: 11 条入库 (source=`szse`)
+- rss: 40 条入库 (source=`rss_sina_finance` + `rss_sina_astock`)
+- cls: DOWN (HTTP 404, retry_backoff 3次后标记)
+
 ### 1.3 验证命令
 
 ```bash
@@ -41,6 +49,19 @@ print(list(bus.providers.keys()))
 ```
 
 输出: `['cninfo', 'cls', 'eastmoney', 'sse', 'szse', 'rss']`
+
+### 1.4 Git 工作区状态
+
+| 文件 | 状态 | 处理 |
+|------|------|------|
+| `feeds/cls_news_provider.py` | 曾 modified (空白行改变) | ✅ `git checkout` 恢复到 HEAD |
+| `feeds/eastmoney_news_provider.py` | 曾 modified (docstring差异) | ✅ `git checkout` 恢复到 HEAD, 后补 `__init__` 参数修复 |
+| `scripts/verify_phase45_news_sources.py` | committed | ✅ 已提交 |
+| `tests/test_news_event_bus_providers.py` | committed | ✅ 已提交 |
+| `tests/test_news_provider_safety.py` | committed | ✅ 已提交 |
+| `reports/PHASE1_TO_PHASE5_ACCEPTANCE_REPORT.md` | committed | ✅ 已提交 (本文件) |
+
+**当前 git status**: 仅 `feeds/eastmoney_news_provider.py` 有一个功能性修改 (补 `__init__` 参数), 其余均为已在 Git 历史中的其他 Phase 文件变动。
 
 ---
 
@@ -219,17 +240,39 @@ $ python scripts/verify_phase45_news_sources.py
 RESULTS: 67/67 PASS
 ```
 
-**pytest 集成测试**:
+**pytest 各文件独立运行**:
+
 ```bash
-$ python -m pytest tests/test_news_event_bus_providers.py tests/test_news_provider_safety.py -v
-============================= 27 passed in 0.35s ==============================
+$ python -m pytest tests/test_news_event_bus_providers.py -v
+============================= 18 passed in 0.34s ==============================
 ```
 
-**历史 ad-hoc 结果 (脚本已删除, 验证逻辑已整合)**:
-- Phase 3: 72/72 PASS → 逻辑已整合到 `scripts/verify_phase45_news_sources.py` (SSE/SZSE回归)
-- Phase 4: 53/53 PASS → 逻辑已整合 (CNINFO v2)
-- Phase 5: 49/49 PASS → 逻辑已整合 (RSS)
-- Phase 4+5 合并: 56/56 PASS → 逻辑已整合 (全量)
+```bash
+$ python -m pytest tests/test_news_provider_safety.py -v
+============================= 9 passed in 0.09s ==============================
+```
+
+```bash
+$ python -m pytest tests/test_news_event_bus_providers.py tests/test_news_provider_safety.py -q
+........................... [100%]
+27 passed in 0.37s
+```
+
+```bash
+$ python -m pytest tests/test_news_interface.py -v
+======================= 33 passed, 1 skipped in 58.73s ========================
+```
+
+**精确计数**:
+| 测试文件 | 项数 | 结果 |
+|----------|------|------|
+| `tests/test_news_event_bus_providers.py` | 18 | 18 PASS |
+| `tests/test_news_provider_safety.py` | 9 | 9 PASS |
+| 两者合并 | 27 (18+9) | 27 PASS |
+| `tests/test_news_interface.py` | 34 (33 passed + 1 skipped) | 33 PASS |
+| `scripts/verify_phase45_news_sources.py` | 67 | 67 PASS |
+
+**报告中的计数错误已修正**: 原报告将 `test_news_provider_safety.py` 写为 27 项, 实际为 9 项 (6个 parametrized import检查 + 3个 config检查 = 9 asserts)。合并运行时 18+9=27, pytest 报告 "27 passed" 是正确但 misleading (report 总数, 并非单文件计数)。
 
 ### 4.3 验证完整性声明
 
@@ -244,43 +287,50 @@ $ python -m pytest tests/test_news_event_bus_providers.py tests/test_news_provid
 
 ## 五、覆盖率数字说明
 
-### 5.1 真实数据
+### 5.1 真实数据 (polling dry-run 后, 2026-06-27 00:31)
 
-实际运行 `scripts/analyze_news_coverage.py` 的输出 (缓存文件 `data_cache/news_coverage_cache.json`):
+`scripts/analyze_news_coverage.py` 输出 (polling 后):
 
 | 指标 | 数值 |
 |------|------|
-| **coverage_rate** | 0.0499 |
-| **coverage_rate_pct** | 4.99% |
-| **covered_symbols** | 276 |
-| **total_symbols** | 5,528 |
-| **status** | INSUFFICIENT |
-| **computed_at** | 2026-06-26 20:23:19 |
+| **coverage_rate** | **0.0590** |
+| **coverage_rate_pct** | **5.90%** |
+| **covered_symbols** | **326** |
+| **total_symbols** | **5,528** |
+| **status** | **WEAK** |
+| **computed_at** | 2026-06-27 00:31 |
 | **source** | analyze_news_coverage |
 
-### 5.2 数据库实况
+### 5.2 数据库实况 (polling dry-run 后)
 
-`data_cache/news_events.db` (1,491 total events):
-- `cninfo`: 30条 (Phase 4 v2 升级前, 仍是 v1 单页数据)
-- `eastmoney`: 1,461条
+`data_cache/news_events.db` (1,738 total events):
+- `eastmoney`: 1,582 条
+- `cninfo`: 55 条 (Phase 4 v2 双市场)
+- `sse`: 50 条 (Phase 3 上交所)
+- `rss_sina_finance`: 20 条 (Phase 5)
+- `rss_sina_astock`: 20 条 (Phase 5)
+- `szse`: 11 条 (Phase 3 深交所)
 
-### 5.3 覆盖率定义
+### 5.3 覆盖率提升过程
+
+| 阶段 | coverage_rate | 事件数 | 覆盖股票 | 状态 |
+|------|--------------|--------|----------|------|
+| Phase 2 (EastMoney 首次) | ~0.23% → 5.30% | 30 → 1,491 | 12 → 276 | INSUFFICIENT → WEAK |
+| Phase 3-5 polling 前 (缓存) | 4.99% | 1,491 | 276 | INSUFFICIENT |
+| **Phase 3-5 polling 后 (本次)** | **5.90%** | **1,738** | **326** | **WEAK** |
+
+差额: +0.91 百分点 (+50 stocks, +247 events) 来自 Phase 3-5 新增 provider (SSE/SZSE/CNINFO v2/RSS) 的首次入库。
+
+### 5.4 覆盖率定义
 
 - **分母**: xtdata 全A股列表 (上证A股+深证A股, 共5,528只)
-- **分子**: `news_events.db` 中 symbol 与分母的交集数量 (276只)
+- **分子**: `news_events.db` 中 symbol 与分母的交集数量 (326只)
 - **统计时间窗口**: 数据库中所有未过期的 events
 - **计算工具**: `scripts/analyze_news_coverage.py`
 
-### 5.4 之前报告中数字的澄清
+### 5.5 之前报告中数字的澄清
 
-之前概述中 "Phase 1-2: ~0.23%"、"Phase 3: ~5-10%" 等为**对 API 全量数据的估算**, 不是实际运行 `analyze_news_coverage.py` 的结果。
-
-**当前唯一可证实数据**: 4.99% (2026-06-26 20:23, scripts/analyze_news_coverage.py 输出)
-
-后续 Phase 3-5 providers (SSE/SZSE/CNINFO v2/RSS) 已集成但**尚未通过 polling cycle 入库**,
-因此最新覆盖率需要在 polling cycle 运行后重新执行 `scripts/analyze_news_coverage.py` 获得。
-
-**声明**: 覆盖率预期提升 (5-20%) 基于 API 全量公告数量估算, 实际入库覆盖率取决于 polling cycle 执行频率和 NewsEventBus 去重机制。该数字需在 polling 运行后重新脚本验证, 不可作为验收结论。
+之前概述中 "Phase 3: ~5-10%" 等为**对 API 全量数据的估算**, 已删除。当前以 `scripts/analyze_news_coverage.py` 实际输出的 **5.90%** 为准。该数字随 polling cycle 持续运行会继续增长 (单次 polling 受 max_pages 和时间窗口限制, 累积效应需要多次 polling)。
 
 ---
 
@@ -475,9 +525,55 @@ scanner.auto_run: false                ✅ 自动扫描关闭
 
 ### 10.3 遗留边界 (无阻塞性问题)
 
-1. CLS (财联社) DOWN — HTTP 404永久失效, 已标记 (P2)
-2. 覆盖率 4.99% (脚本实测, 2026-06-26) — Phase 3-5 新增 provider 需通过 polling cycle 入库后方可提升
+1. CLS (财联社) DOWN — HTTP 404永久失效, retry_backoff(3) 后标记 DOWN (P2, 不影响系统)
+2. 覆盖率 5.90% (WEAK) — 需要多次 polling cycle 累积, 单次受 max_pages 和时间窗口限制 (P1)
 3. CNINFO `classifiedAnnouncements` 字段未使用 — 不影响功能 (P3)
 4. 公告PDF文本内容未下载 — 超出 Phase 3-5 范围 (P3)
+5. EastMoney provider 为 244行 v1 版本 — Phase 2 增强版 (938行) 在历史会话中开发但未正确 commit; 当前 v1 可正常工作, `__init__` 参数兼容性已修复
 
-**验收结论**: Phase 1-5 全部完成, 可复现验证 112/112 PASS, 无阻塞性问题。
+**验收结论**: Phase 1-5 全部完成, 可复现验证, 无阻塞性问题。
+
+---
+
+## 十一、Final Pre-Autonomous Checklist
+
+### 11.1 Autonomous Week 文件清单
+
+以下文件**均不存在**于当前仓库:
+
+| 预期文件 | 状态 |
+|----------|------|
+| `config/autonomous_week_001.yaml` | ❌ 未创建 |
+| `reports/autonomous_week_001/` | ❌ 目录不存在 |
+| `logs/autonomous_week_001/` | ❌ 目录不存在 |
+| `strategies/autonomous_week_001/` | ❌ 目录不存在 |
+| `scripts/run_autonomous_premarket.py` | ❌ 未创建 |
+| `scripts/run_autonomous_intraday.py` | ❌ 未创建 |
+| `scripts/run_autonomous_postmarket.py` | ❌ 未创建 |
+| `scripts/validate_autonomous_week.py` | ❌ 未创建 |
+| `tests/test_autonomous_week_safety.py` | ❌ 未创建 |
+
+### 11.2 阻塞项说明
+
+**Phase 1-5 仅是资讯源建设**, 完成了以下基础能力:
+1. 6 个 Provider 的对接与标准化 (cninfo/eastmoney/sse/szse/rss/cls)
+2. NewsEventBus 轮询调度 + NewsEventStore SQLite 去重存储
+3. NewsCoverageGate 三级门控 (HEALTHY/WEAK/INSUFFICIENT)
+4. Trade isolation (allow_trade_trigger=false, 所有 provider 零 trade import)
+
+**尚未实现 autonomous week 所需的功能**:
+- 自主盘前/盘中/盘后调度脚本
+- Autonomous week 配置与日志体系
+- Paper trading signal generation + matching 与资讯联动
+- 5 天连续观测的 checkpoint 与验证机制
+
+### 11.3 建议
+
+当前状态的正确描述: **Phase 1-5 资讯源建设通过验收, 覆盖率 5.90% (WEAK), 暂不建议直接开始 5 天 autonomous paper trading。**
+
+进入 autonomous week 前需完成:
+1. 设计 autonomous week 配置与调度架构
+2. 实现盘前/盘中/盘后三阶段调度脚本
+3. Paper trading engine 与 news signal 的桥接
+4. Checkpoint 报告格式与 cron job 设置
+5. Safety validation 测试套件

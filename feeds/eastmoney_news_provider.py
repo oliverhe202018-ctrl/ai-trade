@@ -32,11 +32,15 @@ class EastMoneyNewsProvider(BaseNewsProvider):
     限制: 单次只查询一只股票，批量采集需要遍历股票列表
     """
 
-    def __init__(self):
+    def __init__(self, max_pages: int = 5, recent_hours: Optional[int] = None,
+                 categories: Optional[List[str]] = None):
         super().__init__("eastmoney")
         self.timeout = 15
         self._last_call_time = 0
         self._rate_limit = 1.0  # 1 second between calls
+        self.max_pages = max_pages
+        self.recent_hours = recent_hours
+        self.categories = categories or ["stock", "announcement", "report"]
 
     def _rate_limit_wait(self):
         """遵守速率限制"""
